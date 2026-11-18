@@ -1,0 +1,43 @@
+# Environment variables
+.env
+
+# Virtual environment
+.venv/
+env/
+venv/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# pytest cache
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local downloaded SEC files and runtime data
+data/raw/
+data/
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# Model weights
+*.pt
+*.pth
+*.bin
+*.onnx
+*.safetensors
+
+# Temporary output files and logs
+*.log
+*.tmp
+temp/
+tmp/
+
+# OS-generated temporary files
+.DS_Store
+Thumbs.db
+desktop.ini
