@@ -15,9 +15,10 @@ from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+PROJECT_ENV_PATH = BASE_DIR / ".env"
 RAW_DATA_DIR = BASE_DIR / "data" / "raw"
 
-# Rate limit delay to stay well under SEC's 10 requests/sec limit
+# Rate limit delay to stay comfortably below SEC's 10 requests/sec limit
 SEC_REQUEST_INTERVAL = 0.2
 DEFAULT_TIMEOUT = 15.0
 
@@ -54,6 +55,13 @@ class SecSession(requests.Session):
         return super().request(method, url, **kwargs)
 
 
+def load_project_env(env_path: Path | None = None) -> None:
+    """Load environment variables from the project's .env file only."""
+    target_path = env_path if env_path is not None else PROJECT_ENV_PATH
+    if target_path.is_file():
+        load_dotenv(dotenv_path=target_path)
+
+
 def validate_user_agent(user_agent: str | None) -> str:
     """Validate that the User-Agent is present, genuine, and not a placeholder."""
     if not user_agent or not isinstance(user_agent, str) or not user_agent.strip():
@@ -64,21 +72,21 @@ def validate_user_agent(user_agent: str | None) -> str:
 
     if any(p in cleaned_lower for p in _PLACEHOLDER_SUBSTRINGS) or "<" in cleaned or ">" in cleaned:
         raise ValueError(
-            f"Invalid or placeholder SEC User-Agent: '{cleaned}'. Genuine contact information is required by the SEC."
+            "Invalid or placeholder SEC User-Agent. Genuine contact information is required by the SEC."
         )
 
     # Must contain a contact email address conforming to standard SEC requirements
     if not re.search(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", cleaned):
         raise ValueError(
-            f"Invalid SEC User-Agent: '{cleaned}'. SEC requires a genuine contact email address."
+            "Invalid SEC User-Agent: missing a valid contact email address. SEC requires genuine contact details."
         )
 
     return cleaned
 
 
-def make_sec_session(user_agent: str | None = None) -> requests.Session:
+def make_sec_session(user_agent: str | None = None, env_path: Path | None = None) -> requests.Session:
     """Create a configured requests.Session for SEC API requests."""
-    load_dotenv()
+    load_project_env(env_path)
     ua = user_agent if user_agent is not None else os.environ.get("SEC_USER_AGENT")
     valid_ua = validate_user_agent(ua)
 
@@ -129,12 +137,18 @@ def sec_get_json(url: str, session: requests.Session | None = None) -> dict:
 
 
 def normalize_cik(cik: str | int) -> str:
-    """Validate and zero-pad a CIK to 10 digits."""
+    """Validate and zero-pad a CIK to 10 digits.
+
+    Accepts positive numeric identifiers up to ten digits.
+    Rejects negative, zero, nonnumeric, and longer-than-ten-digit identifiers.
+    """
     if cik is None:
         raise ValueError("CIK cannot be None.")
     cik_str = str(cik).strip()
     if not cik_str.isdigit():
         raise ValueError(f"Invalid CIK: '{cik}'. CIK must be a numeric integer.")
+    if len(cik_str) > 10:
+        raise ValueError(f"Invalid CIK: '{cik}'. CIK identifier must not exceed 10 digits.")
     cik_int = int(cik_str)
     if cik_int <= 0:
         raise ValueError(f"Invalid CIK: '{cik}'. CIK must be greater than zero.")
@@ -157,6 +171,68 @@ def _atomic_write_json(file_path: Path, data: Any) -> None:
                 pass
 
 
+def validate_companyfacts_response(data: Any, expected_cik: str) -> None:
+    """Validate that company-facts response is a dictionary with valid CIK and facts."""
+    if not isinstance(data, dict):
+        raise ValueError("Invalid company facts response: payload must be a JSON object.")
+    if "facts" not in data or not isinstance(data["facts"], dict):
+        raise ValueError("Invalid company facts response: missing or invalid 'facts' dictionary.")
+    if "cik" not in data:
+        raise ValueError("Invalid company facts response: missing 'cik' field.")
+    try:
+        response_cik = normalize_cik(data["cik"])
+    except ValueError as exc:
+        raise ValueError(f"Invalid company facts response: invalid 'cik' in payload ({exc}).") from exc
+
+    expected_norm = normalize_cik(expected_cik)
+    if response_cik != expected_norm:
+        raise ValueError(
+            f"CIK mismatch in company facts response: requested CIK {expected_norm}, got CIK {response_cik}."
+        )
+
+
+def validate_submissions_response(data: Any, expected_cik: str) -> None:
+    """Validate that submissions response is a dictionary with valid CIK and filings."""
+    if not isinstance(data, dict):
+        raise ValueError("Invalid submissions response: payload must be a JSON object.")
+    if "filings" not in data or not isinstance(data["filings"], dict):
+        raise ValueError("Invalid submissions response: missing or invalid 'filings' dictionary.")
+    if "cik" not in data:
+        raise ValueError("Invalid submissions response: missing 'cik' field.")
+    try:
+        response_cik = normalize_cik(data["cik"])
+    except ValueError as exc:
+        raise ValueError(f"Invalid submissions response: invalid 'cik' in payload ({exc}).") from exc
+
+    expected_norm = normalize_cik(expected_cik)
+    if response_cik != expected_norm:
+        raise ValueError(
+            f"CIK mismatch in submissions response: requested CIK {expected_norm}, got CIK {response_cik}."
+        )
+
+
+def validate_ticker_payload(raw_data: Any) -> None:
+    """Validate company ticker mapping before writing it to cache."""
+    if not isinstance(raw_data, (dict, list)):
+        raise ValueError("Malformed company tickers payload: expected a JSON object or array.")
+
+    items = raw_data.values() if isinstance(raw_data, dict) else raw_data
+    valid_count = 0
+    for item in items:
+        if isinstance(item, dict):
+            ticker_val = item.get("ticker")
+            cik_val = item.get("cik_str", item.get("cik"))
+            if ticker_val and cik_val is not None:
+                try:
+                    normalize_cik(cik_val)
+                    valid_count += 1
+                except ValueError:
+                    continue
+
+    if valid_count == 0:
+        raise ValueError("Malformed company tickers data: no valid ticker entries found.")
+
+
 def load_company_tickers(
     session: requests.Session | None = None,
     cache_dir: Path | None = None,
@@ -168,23 +244,21 @@ def load_company_tickers(
 
     raw_data: Any = None
     if not force_refresh:
-        for p in [cache_file, raw_dir / "mapping.json"]:
-            if p.is_file():
-                try:
-                    with open(p, "r", encoding="utf-8") as f:
-                        raw_data = json.load(f)
-                    break
-                except Exception as exc:
-                    raise ValueError(f"Failed to read cached company tickers from {p}: {exc}") from exc
+        if cache_file.is_file():
+            try:
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    raw_data = json.load(f)
+            except Exception as exc:
+                raise ValueError(f"Failed to read cached company tickers from {cache_file}: {exc}") from exc
 
     if raw_data is None:
         if session is None:
             session = make_sec_session()
         raw_data = sec_get_json("https://www.sec.gov/files/company_tickers.json", session=session)
+        validate_ticker_payload(raw_data)
         _atomic_write_json(cache_file, raw_data)
-
-    if not isinstance(raw_data, (dict, list)):
-        raise ValueError("Malformed company tickers payload: expected a JSON object or array.")
+    else:
+        validate_ticker_payload(raw_data)
 
     mapping: dict[str, dict[str, str]] = {}
     items = raw_data.values() if isinstance(raw_data, dict) else raw_data
@@ -205,9 +279,6 @@ def load_company_tickers(
                 "ticker": ticker_clean,
                 "company_name": str(title_val).strip(),
             }
-
-    if not mapping:
-        raise ValueError("Malformed company tickers data: no valid ticker entries found.")
 
     return mapping
 
@@ -241,19 +312,19 @@ def get_submissions(
     cache_file = raw_dir / "submissions" / f"CIK{cik_norm}.json"
 
     if not force_refresh:
-        for p in [cache_file, raw_dir / f"CIK{cik_norm}.json"]:
-            if p.is_file():
-                try:
-                    with open(p, "r", encoding="utf-8") as f:
-                        return json.load(f)
-                except Exception as exc:
-                    raise ValueError(f"Failed to read cached submissions file {p}: {exc}") from exc
+        if cache_file.is_file():
+            try:
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as exc:
+                raise ValueError(f"Failed to read cached submissions file {cache_file}: {exc}") from exc
 
     if session is None:
         session = make_sec_session()
 
     url = f"https://data.sec.gov/submissions/CIK{cik_norm}.json"
     data = sec_get_json(url, session=session)
+    validate_submissions_response(data, cik_norm)
     _atomic_write_json(cache_file, data)
     return data
 
@@ -270,19 +341,19 @@ def get_companyfacts(
     cache_file = raw_dir / "companyfacts" / f"CIK{cik_norm}.json"
 
     if not force_refresh:
-        for p in [cache_file, raw_dir / f"companyfacts_CIK{cik_norm}.json", raw_dir / f"CIK{cik_norm}.json"]:
-            if p.is_file():
-                try:
-                    with open(p, "r", encoding="utf-8") as f:
-                        return json.load(f)
-                except Exception as exc:
-                    raise ValueError(f"Failed to read cached companyfacts file {p}: {exc}") from exc
+        if cache_file.is_file():
+            try:
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as exc:
+                raise ValueError(f"Failed to read cached companyfacts file {cache_file}: {exc}") from exc
 
     if session is None:
         session = make_sec_session()
 
     url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik_norm}.json"
     data = sec_get_json(url, session=session)
+    validate_companyfacts_response(data, cik_norm)
     _atomic_write_json(cache_file, data)
     return data
 
@@ -307,8 +378,7 @@ def main() -> None:
 
     cik_norm = normalize_cik(company["cik"])
     cache_file = RAW_DATA_DIR / "companyfacts" / f"CIK{cik_norm}.json"
-    alt_file = RAW_DATA_DIR / f"CIK{cik_norm}.json"
-    is_cached = cache_file.is_file() or alt_file.is_file()
+    is_cached = cache_file.is_file()
     cache_status = "cached" if is_cached else "downloaded"
 
     try:
