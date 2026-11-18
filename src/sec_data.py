@@ -17,10 +17,26 @@ from urllib3.util import Retry
 BASE_DIR = Path(__file__).resolve().parent.parent
 PROJECT_ENV_PATH = BASE_DIR / ".env"
 RAW_DATA_DIR = BASE_DIR / "data" / "raw"
+PROCESSED_DATA_DIR = BASE_DIR / "data" / "processed"
 
 # Rate limit delay to stay comfortably below SEC's 10 requests/sec limit
 SEC_REQUEST_INTERVAL = 0.2
 DEFAULT_TIMEOUT = 15.0
+
+COLLECTION_CUTOFF_DATE = "2026-11-18"
+TARGET_FISCAL_YEARS = [2023, 2024, 2025]
+
+COMPANY_PANEL: dict[str, list[str]] = {
+    "Technology": ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META"],
+    "Financial services": ["JPM", "BAC", "WFC", "GS", "MS", "C"],
+    "Healthcare": ["JNJ", "PFE", "MRK", "ABBV", "UNH", "ABT"],
+    "Energy and utilities": ["XOM", "CVX", "COP", "NEE", "DUK", "SO"],
+    "Consumer": ["WMT", "COST", "PG", "KO", "PEP", "MCD"],
+}
+
+PANEL_TICKERS: dict[str, str] = {
+    ticker: sector for sector, tickers in COMPANY_PANEL.items() for ticker in tickers
+}
 
 _PLACEHOLDER_SUBSTRINGS = (
     "yourrealname",
@@ -358,10 +374,383 @@ def get_companyfacts(
     return data
 
 
+def filing_url(cik: str | int, accession: str, primary_document: str) -> str:
+    """Construct official SEC archive URL for a filing document."""
+    cik_number = str(int(cik))
+    accession_compact = accession.replace("-", "")
+    doc_basename = Path(primary_document).name
+    return f"https://www.sec.gov/Archives/edgar/data/{cik_number}/{accession_compact}/{doc_basename}"
+
+
+def list_filings(
+    cik: str | int,
+    forms: list[str] | tuple[str, ...] | set[str] | None = None,
+    as_of: str | None = None,
+    session: requests.Session | None = None,
+    cache_dir: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Extract filing records from SEC submissions matching requested forms and cutoff."""
+    cik_norm = normalize_cik(cik)
+    submissions = get_submissions(cik_norm, session=session, cache_dir=cache_dir)
+
+    raw_dir = Path(cache_dir) if cache_dir is not None else RAW_DATA_DIR
+    target_forms = set(forms) if forms is not None else None
+
+    results: list[dict[str, Any]] = []
+
+    def _process_filing_arrays(recent_dict: dict[str, Any]) -> None:
+        accessions = recent_dict.get("accessionNumber", [])
+        form_list = recent_dict.get("form", [])
+        filing_dates = recent_dict.get("filingDate", [])
+        report_dates = recent_dict.get("reportDate", [])
+        primary_docs = recent_dict.get("primaryDocument", [])
+
+        if not (isinstance(accessions, list) and isinstance(form_list, list)):
+            return
+
+        n = min(
+            len(accessions),
+            len(form_list),
+            len(filing_dates) if isinstance(filing_dates, list) else 0,
+            len(report_dates) if isinstance(report_dates, list) else 0,
+            len(primary_docs) if isinstance(primary_docs, list) else 0,
+        )
+
+        for i in range(n):
+            form_val = str(form_list[i]).strip()
+            if target_forms is not None and form_val not in target_forms:
+                continue
+
+            filing_date_val = str(filing_dates[i]).strip() if filing_dates[i] else ""
+            if as_of is not None and filing_date_val and filing_date_val > as_of:
+                continue
+
+            accn_val = str(accessions[i]).strip()
+            report_date_val = str(report_dates[i]).strip() if report_dates[i] else ""
+            doc_val = str(primary_docs[i]).strip() if primary_docs[i] else ""
+
+            results.append(
+                {
+                    "accession_number": accn_val,
+                    "form": form_val,
+                    "filing_date": filing_date_val,
+                    "report_date": report_date_val,
+                    "primary_document": doc_val,
+                    "cik": cik_norm,
+                    "source_url": filing_url(cik_norm, accn_val, doc_val) if doc_val else "",
+                }
+            )
+
+    filings_obj = submissions.get("filings", {})
+    if isinstance(filings_obj, dict):
+        recent = filings_obj.get("recent", {})
+        if isinstance(recent, dict):
+            _process_filing_arrays(recent)
+
+        # Use older submission pages from filings.files only when necessary (e.g. recent does not reach 2023)
+        filing_dates = recent.get("filingDate", []) if isinstance(recent, dict) else []
+        oldest_recent = min(filing_dates) if filing_dates else ""
+        if oldest_recent and oldest_recent > "2023-01-01":
+            files_list = filings_obj.get("files", [])
+            if isinstance(files_list, list) and files_list:
+                for file_info in files_list:
+                    if not isinstance(file_info, dict):
+                        continue
+                    filing_to = file_info.get("filingTo", "")
+                    if filing_to and filing_to < "2023-01-01":
+                        continue
+                    name = file_info.get("name")
+                    if not name:
+                        continue
+                    old_cache = raw_dir / "submissions" / name
+                    old_data: Any = None
+                    if old_cache.is_file():
+                        try:
+                            with open(old_cache, "r", encoding="utf-8") as f:
+                                old_data = json.load(f)
+                        except Exception:
+                            pass
+                    if old_data is None and session is not None:
+                        try:
+                            old_url = f"https://data.sec.gov/submissions/{name}"
+                            old_data = sec_get_json(old_url, session=session)
+                            _atomic_write_json(old_cache, old_data)
+                        except Exception:
+                            pass
+                    if isinstance(old_data, dict):
+                        _process_filing_arrays(old_data)
+
+    return results
+
+
+def extract_xbrl_10k_fiscal_years(companyfacts_data: dict) -> dict[str, int]:
+    """Map Form 10-K accession numbers to their XBRL-reported fiscal years.
+
+    Only unanimous fiscal years are mapped; ambiguous accessions are omitted.
+    """
+    accn_to_years: dict[str, set[int]] = {}
+    facts = companyfacts_data.get("facts", {})
+    if not isinstance(facts, dict):
+        return {}
+
+    for taxonomy in ("us-gaap", "dei"):
+        tax_dict = facts.get(taxonomy, {})
+        if not isinstance(tax_dict, dict):
+            continue
+        for concept_data in tax_dict.values():
+            if not isinstance(concept_data, dict):
+                continue
+            units_dict = concept_data.get("units", {})
+            if not isinstance(units_dict, dict):
+                continue
+            for rows in units_dict.values():
+                if not isinstance(rows, list):
+                    continue
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    if row.get("form") == "10-K" and row.get("fp") == "FY":
+                        accn = row.get("accn")
+                        fy = row.get("fy")
+                        if accn and isinstance(fy, int):
+                            accn_to_years.setdefault(accn, set()).add(fy)
+
+    confirmed_map: dict[str, int] = {}
+    for accn, years in accn_to_years.items():
+        if len(years) == 1:
+            confirmed_map[accn] = next(iter(years))
+    return confirmed_map
+
+
+def select_annual_filings_for_company(
+    cik: str | int,
+    ticker: str,
+    company_name: str,
+    sector: str,
+    target_years: list[int] = TARGET_FISCAL_YEARS,
+    as_of: str = COLLECTION_CUTOFF_DATE,
+    session: requests.Session | None = None,
+    cache_dir: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Select 10-K filings for target fiscal years with confirmed/needs_review/missing status."""
+    cik_norm = normalize_cik(cik)
+    all_filings = list_filings(
+        cik_norm,
+        forms=["10-K", "10-K/A"],
+        as_of=as_of,
+        session=session,
+        cache_dir=cache_dir,
+    )
+
+    try:
+        facts_data = get_companyfacts(cik_norm, session=session, cache_dir=cache_dir)
+        xbrl_fy_map = extract_xbrl_10k_fiscal_years(facts_data)
+    except Exception:
+        xbrl_fy_map = {}
+
+    fy_to_10k: dict[int, list[tuple[dict[str, Any], str]]] = {}
+    fy_to_10ka: dict[int, list[tuple[dict[str, Any], str]]] = {}
+
+    for f in all_filings:
+        accn = f["accession_number"]
+        form_name = f["form"]
+        r_date = f["report_date"]
+
+        r_year: int | None = None
+        if r_date and len(r_date) >= 4 and r_date[:4].isdigit():
+            r_year = int(r_date[:4])
+
+        if accn in xbrl_fy_map:
+            assigned_fy = xbrl_fy_map[accn]
+            if r_year is not None and abs(r_year - assigned_fy) <= 1:
+                status = "confirmed" if form_name == "10-K" else "needs_review"
+            else:
+                status = "needs_review"
+        elif r_year is not None:
+            assigned_fy = r_year
+            status = "needs_review"
+        else:
+            continue
+
+        if form_name == "10-K":
+            fy_to_10k.setdefault(assigned_fy, []).append((f, status))
+        elif form_name == "10-K/A":
+            fy_to_10ka.setdefault(assigned_fy, []).append((f, "needs_review"))
+
+    manifest_records: list[dict[str, Any]] = []
+
+    for year in target_years:
+        k_candidates = fy_to_10k.get(year, [])
+        ka_candidates = fy_to_10ka.get(year, [])
+
+        if k_candidates:
+            if len(k_candidates) == 1:
+                filing, st = k_candidates[0]
+                manifest_records.append(
+                    {
+                        "ticker": ticker,
+                        "company_name": company_name,
+                        "cik": cik_norm,
+                        "sector": sector,
+                        "target_fiscal_year": year,
+                        "fiscal_year_status": st,
+                        "form": filing["form"],
+                        "accession_number": filing["accession_number"],
+                        "filing_date": filing["filing_date"],
+                        "report_date": filing["report_date"],
+                        "primary_document": filing["primary_document"],
+                        "source_url": filing["source_url"],
+                    }
+                )
+            else:
+                filing, _ = k_candidates[0]
+                manifest_records.append(
+                    {
+                        "ticker": ticker,
+                        "company_name": company_name,
+                        "cik": cik_norm,
+                        "sector": sector,
+                        "target_fiscal_year": year,
+                        "fiscal_year_status": "needs_review",
+                        "form": filing["form"],
+                        "accession_number": filing["accession_number"],
+                        "filing_date": filing["filing_date"],
+                        "report_date": filing["report_date"],
+                        "primary_document": filing["primary_document"],
+                        "source_url": filing["source_url"],
+                    }
+                )
+        elif ka_candidates:
+            filing, _ = ka_candidates[0]
+            manifest_records.append(
+                {
+                    "ticker": ticker,
+                    "company_name": company_name,
+                    "cik": cik_norm,
+                    "sector": sector,
+                    "target_fiscal_year": year,
+                    "fiscal_year_status": "needs_review",
+                    "form": filing["form"],
+                    "accession_number": filing["accession_number"],
+                    "filing_date": filing["filing_date"],
+                    "report_date": filing["report_date"],
+                    "primary_document": filing["primary_document"],
+                    "source_url": filing["source_url"],
+                }
+            )
+        else:
+            manifest_records.append(
+                {
+                    "ticker": ticker,
+                    "company_name": company_name,
+                    "cik": cik_norm,
+                    "sector": sector,
+                    "target_fiscal_year": year,
+                    "fiscal_year_status": "missing",
+                    "form": None,
+                    "accession_number": None,
+                    "filing_date": None,
+                    "report_date": None,
+                    "primary_document": None,
+                    "source_url": None,
+                }
+            )
+
+    return manifest_records
+
+
+def collect_panel_data(
+    session: requests.Session | None = None,
+    cache_dir: Path | None = None,
+    output_path: Path | None = None,
+    as_of: str = COLLECTION_CUTOFF_DATE,
+) -> dict[str, Any]:
+    """Process the 30-company panel, download/reuse SEC JSON data, and build filing manifest."""
+    if session is None:
+        session = make_sec_session()
+
+    raw_dir = Path(cache_dir) if cache_dir is not None else RAW_DATA_DIR
+    save_manifest_path = Path(output_path) if output_path is not None else (PROCESSED_DATA_DIR / "filing_manifest.json")
+
+    companies_processed = 0
+    companies_successful = 0
+    download_failures = 0
+    manifest_records: list[dict[str, Any]] = []
+
+    for sector, tickers in COMPANY_PANEL.items():
+        for ticker in tickers:
+            companies_processed += 1
+            try:
+                company = resolve_ticker(ticker, session=session, cache_dir=raw_dir)
+                cik = company["cik"]
+                company_name = company["company_name"]
+
+                get_submissions(cik, session=session, cache_dir=raw_dir)
+                get_companyfacts(cik, session=session, cache_dir=raw_dir)
+
+                records = select_annual_filings_for_company(
+                    cik=cik,
+                    ticker=ticker,
+                    company_name=company_name,
+                    sector=sector,
+                    target_years=TARGET_FISCAL_YEARS,
+                    as_of=as_of,
+                    session=session,
+                    cache_dir=raw_dir,
+                )
+                manifest_records.extend(records)
+                companies_successful += 1
+            except Exception:
+                download_failures += 1
+                for year in TARGET_FISCAL_YEARS:
+                    manifest_records.append(
+                        {
+                            "ticker": ticker,
+                            "company_name": ticker,
+                            "cik": "",
+                            "sector": sector,
+                            "target_fiscal_year": year,
+                            "fiscal_year_status": "missing",
+                            "form": None,
+                            "accession_number": None,
+                            "filing_date": None,
+                            "report_date": None,
+                            "primary_document": None,
+                            "source_url": None,
+                        }
+                    )
+
+    confirmed_count = sum(1 for r in manifest_records if r["fiscal_year_status"] == "confirmed")
+    needs_review_count = sum(1 for r in manifest_records if r["fiscal_year_status"] == "needs_review")
+    missing_count = sum(1 for r in manifest_records if r["fiscal_year_status"] == "missing")
+    annual_filings_identified = sum(1 for r in manifest_records if r.get("accession_number"))
+
+    _atomic_write_json(save_manifest_path, manifest_records)
+
+    summary = {
+        "companies_processed": companies_processed,
+        "companies_successful": companies_successful,
+        "annual_filings_identified": annual_filings_identified,
+        "confirmed_records": confirmed_count,
+        "needs_review_records": needs_review_count,
+        "missing_records": missing_count,
+        "download_failures": download_failures,
+        "manifest_path": str(save_manifest_path),
+    }
+
+    return summary
+
+
 def main() -> None:
-    """CLI entrypoint for verifying ticker resolution and company facts."""
+    """CLI entrypoint for verifying ticker resolution and company facts or panel collection."""
     parser = argparse.ArgumentParser(description="SEC data client CLI")
-    parser.add_argument("--ticker", required=True, help="Company ticker symbol (e.g. MSFT)")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--ticker", help="Company ticker symbol (e.g. MSFT)")
+    group.add_argument(
+        "--collect-panel",
+        action="store_true",
+        help="Collect data and generate annual filing manifest for the 30-company panel",
+    )
     args = parser.parse_args()
 
     try:
@@ -369,6 +758,22 @@ def main() -> None:
     except ValueError as exc:
         sys.stderr.write(f"Configuration error: {exc}\n")
         sys.exit(1)
+
+    if args.collect_panel:
+        try:
+            summary = collect_panel_data(session=session)
+        except Exception as exc:
+            sys.stderr.write(f"Error during panel collection: {exc}\n")
+            sys.exit(1)
+
+        print(f"Companies processed: {summary['companies_processed']}")
+        print(f"Companies successful: {summary['companies_successful']}")
+        print(f"Annual filings identified: {summary['annual_filings_identified']}")
+        print(f"Confirmed fiscal-year records: {summary['confirmed_records']}")
+        print(f"Records needing review: {summary['needs_review_records']}")
+        print(f"Missing records: {summary['missing_records']}")
+        print(f"Download failures: {summary['download_failures']}")
+        return
 
     try:
         company = resolve_ticker(args.ticker, session=session)
