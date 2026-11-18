@@ -10,6 +10,7 @@ import requests
 from src.sec_data import (
     COLLECTION_CUTOFF_DATE,
     COMPANY_PANEL,
+    FINANCIAL_METRICS,
     HISTORICAL_PANEL_REGISTRANTS,
     PANEL_TICKERS,
     TARGET_FISCAL_YEARS,
@@ -20,10 +21,13 @@ from src.sec_data import (
     get_submissions,
     list_filings,
     load_company_tickers,
+    load_filing_manifest,
     make_sec_session,
     normalize_cik,
+    normalize_panel_facts,
     resolve_ticker,
     select_annual_filings_for_company,
+    select_financial_fact,
     validate_companyfacts_response,
     validate_submissions_response,
     validate_ticker_payload,
@@ -795,3 +799,612 @@ def test_cli_collect_panel(monkeypatch: pytest.MonkeyPatch, capsys: pytest.Captu
     assert "Records needing review: 0" in captured.out
     assert "Missing records: 2" in captured.out
     assert "Download failures: 0" in captured.out
+
+
+MOCK_AAPL_MANIFEST_RECORD = {
+    "ticker": "AAPL",
+    "company_name": "Apple Inc.",
+    "cik": "0000320193",
+    "sector": "Technology",
+    "target_fiscal_year": 2024,
+    "fiscal_year_status": "confirmed",
+    "form": "10-K",
+    "accession_number": "0000320193-24-000100",
+    "filing_date": "2024-11-01",
+    "report_date": "2024-09-30",
+    "primary_document": "aapl-20240930.htm",
+    "source_url": "https://www.sec.gov/Archives/edgar/data/320193/000032019324000100/aapl-20240930.htm",
+}
+
+
+def test_fact_1_annual_revenue_extraction() -> None:
+    """Test 1: Correct annual revenue extraction."""
+    facts_data = {
+        "cik": 320193,
+        "entityName": "Apple Inc.",
+        "facts": {
+            "us-gaap": {
+                "RevenueFromContractWithCustomerExcludingAssessedTax": {
+                    "units": {
+                        "USD": [
+                            {
+                                "val": 391035000000,
+                                "form": "10-K",
+                                "fp": "FY",
+                                "fy": 2024,
+                                "accn": "0000320193-24-000100",
+                                "start": "2023-10-01",
+                                "end": "2024-09-30",
+                                "filed": "2024-11-01",
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+    }
+    res = select_financial_fact(MOCK_AAPL_MANIFEST_RECORD, "revenue", facts_data)
+    assert res["status"] == "found"
+    assert res["value"] == 391035000000
+    assert res["unit"] == "USD"
+    assert res["tag"] == "RevenueFromContractWithCustomerExcludingAssessedTax"
+    assert res["period_start"] == "2023-10-01"
+    assert res["period_end"] == "2024-09-30"
+    assert res["accession"] == "0000320193-24-000100"
+    assert res["reason"] is None
+
+
+def test_fact_2_instant_asset_extraction() -> None:
+    """Test 2: Correct instant asset extraction."""
+    facts_data = {
+        "cik": 320193,
+        "entityName": "Apple Inc.",
+        "facts": {
+            "us-gaap": {
+                "Assets": {
+                    "units": {
+                        "USD": [
+                            {
+                                "val": 364980000000,
+                                "form": "10-K",
+                                "fp": "FY",
+                                "fy": 2024,
+                                "accn": "0000320193-24-000100",
+                                "end": "2024-09-30",
+                                "filed": "2024-11-01",
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+    }
+    res = select_financial_fact(MOCK_AAPL_MANIFEST_RECORD, "assets", facts_data)
+    assert res["status"] == "found"
+    assert res["value"] == 364980000000
+    assert res["unit"] == "USD"
+    assert res["tag"] == "Assets"
+    assert res["period_start"] is None
+    assert res["period_end"] == "2024-09-30"
+    assert res["reason"] is None
+
+
+def test_fact_3_june_fiscal_year_end_msft() -> None:
+    """Test 3: Microsoft fiscal year ending in June."""
+    msft_rec = {
+        "ticker": "MSFT",
+        "company_name": "MICROSOFT CORP",
+        "cik": "0000789019",
+        "sector": "Technology",
+        "target_fiscal_year": 2024,
+        "fiscal_year_status": "confirmed",
+        "form": "10-K",
+        "accession_number": "0000950170-24-087843",
+        "filing_date": "2024-07-30",
+        "report_date": "2024-06-30",
+        "primary_document": "msft-20240630.htm",
+        "source_url": "https://www.sec.gov/Archives/edgar/data/789019/000095017024087843/msft-20240630.htm",
+    }
+    msft_facts = {
+        "cik": 789019,
+        "entityName": "MICROSOFT CORP",
+        "facts": {
+            "us-gaap": {
+                "NetIncomeLoss": {
+                    "units": {
+                        "USD": [
+                            {
+                                "val": 88136000000,
+                                "form": "10-K",
+                                "fp": "FY",
+                                "fy": 2024,
+                                "accn": "0000950170-24-087843",
+                                "start": "2023-07-01",
+                                "end": "2024-06-30",
+                                "filed": "2024-07-30",
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+    }
+    res = select_financial_fact(msft_rec, "net_income", msft_facts)
+    assert res["status"] == "found"
+    assert res["value"] == 88136000000
+    assert res["period_start"] == "2023-07-01"
+    assert res["period_end"] == "2024-06-30"
+
+
+def test_fact_4_january_fiscal_year_end_wmt() -> None:
+    """Test 4: Walmart-style fiscal year ending in January."""
+    wmt_rec = {
+        "ticker": "WMT",
+        "company_name": "Walmart Inc.",
+        "cik": "0000104169",
+        "sector": "Consumer",
+        "target_fiscal_year": 2024,
+        "fiscal_year_status": "confirmed",
+        "form": "10-K",
+        "accession_number": "0000104169-24-000056",
+        "filing_date": "2024-03-22",
+        "report_date": "2024-01-31",
+        "primary_document": "wmt-20240131.htm",
+        "source_url": "https://www.sec.gov/Archives/edgar/data/104169/000010416924000056/wmt-20240131.htm",
+    }
+    wmt_facts = {
+        "cik": 104169,
+        "entityName": "Walmart Inc.",
+        "facts": {
+            "us-gaap": {
+                "Assets": {
+                    "units": {
+                        "USD": [
+                            {
+                                "val": 252399000000,
+                                "form": "10-K",
+                                "fp": "FY",
+                                "fy": 2024,
+                                "accn": "0000104169-24-000056",
+                                "end": "2024-01-31",
+                                "filed": "2024-03-22",
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+    }
+    res = select_financial_fact(wmt_rec, "assets", wmt_facts)
+    assert res["status"] == "found"
+    assert res["value"] == 252399000000
+    assert res["period_end"] == "2024-01-31"
+
+
+def test_fact_5_xom_historical_reporting_cik() -> None:
+    """Test 5: ExxonMobil's historical reporting CIK."""
+    xom_rec = {
+        "ticker": "XOM",
+        "company_name": "EXXON MOBIL CORP",
+        "cik": "0000034088",
+        "sector": "Energy and utilities",
+        "target_fiscal_year": 2025,
+        "fiscal_year_status": "confirmed",
+        "form": "10-K",
+        "accession_number": "0000034088-26-000045",
+        "filing_date": "2026-02-25",
+        "report_date": "2025-12-31",
+        "primary_document": "xom-20251231.htm",
+        "source_url": "https://www.sec.gov/Archives/edgar/data/34088/000003408826000045/xom-20251231.htm",
+    }
+    xom_facts = {
+        "cik": 34088,
+        "entityName": "EXXON MOBIL CORP",
+        "facts": {
+            "us-gaap": {
+                "NetIncomeLoss": {
+                    "units": {
+                        "USD": [
+                            {
+                                "val": 28844000000,
+                                "form": "10-K",
+                                "fp": "FY",
+                                "fy": 2025,
+                                "accn": "0000034088-26-000045",
+                                "start": "2025-01-01",
+                                "end": "2025-12-31",
+                                "filed": "2026-02-25",
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+    }
+    res = select_financial_fact(xom_rec, "net_income", xom_facts)
+    assert res["status"] == "found"
+    assert res["cik"] == "0000034088"
+    assert res["company_name"] == "EXXON MOBIL CORP"
+    assert res["value"] == 28844000000
+    assert res["accession"] == "0000034088-26-000045"
+
+
+def test_fact_6_rejection_of_quarterly_revenue() -> None:
+    """Test 6: Rejection of quarterly revenue (<330 days)."""
+    facts_quarterly = {
+        "cik": 320193,
+        "entityName": "Apple Inc.",
+        "facts": {
+            "us-gaap": {
+                "RevenueFromContractWithCustomerExcludingAssessedTax": {
+                    "units": {
+                        "USD": [
+                            {
+                                "val": 94930000000,
+                                "form": "10-K",
+                                "fp": "Q4",
+                                "fy": 2024,
+                                "accn": "0000320193-24-000100",
+                                "start": "2024-07-01",
+                                "end": "2024-09-30",
+                                "filed": "2024-11-01",
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+    }
+    res = select_financial_fact(MOCK_AAPL_MANIFEST_RECORD, "revenue", facts_quarterly)
+    assert res["status"] == "missing"
+    assert res["value"] is None
+    assert "No matching 10-K facts" in res["reason"]
+
+
+def test_fact_7_rejection_of_prior_year_comparison_figures() -> None:
+    """Test 7: Rejection of prior-year comparison figures from the wrong period."""
+    facts_comparative = {
+        "cik": 320193,
+        "entityName": "Apple Inc.",
+        "facts": {
+            "us-gaap": {
+                "RevenueFromContractWithCustomerExcludingAssessedTax": {
+                    "units": {
+                        "USD": [
+                            {
+                                "val": 383285000000,
+                                "form": "10-K",
+                                "fp": "FY",
+                                "fy": 2023,
+                                "accn": "0000320193-24-000100",
+                                "start": "2022-10-01",
+                                "end": "2023-09-30",
+                                "filed": "2024-11-01",
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+    }
+    res = select_financial_fact(MOCK_AAPL_MANIFEST_RECORD, "revenue", facts_comparative)
+    assert res["status"] == "missing"
+    assert res["value"] is None
+
+
+def test_fact_8_missing_accounting_tag() -> None:
+    """Test 8: Missing accounting tag produces missing status and reason."""
+    facts_no_opinc = {
+        "cik": 320193,
+        "entityName": "Apple Inc.",
+        "facts": {
+            "us-gaap": {
+                "Assets": {"units": {"USD": []}}
+            }
+        },
+    }
+    res = select_financial_fact(MOCK_AAPL_MANIFEST_RECORD, "operating_income", facts_no_opinc)
+    assert res["status"] == "missing"
+    assert res["value"] is None
+    assert res["reason"] is not None
+
+
+def test_fact_9_conflicting_financial_values() -> None:
+    """Test 9: Conflicting financial values marked ambiguous."""
+    facts_conflicting = {
+        "cik": 320193,
+        "entityName": "Apple Inc.",
+        "facts": {
+            "us-gaap": {
+                "RevenueFromContractWithCustomerExcludingAssessedTax": {
+                    "units": {
+                        "USD": [
+                            {
+                                "val": 300000000,
+                                "form": "10-K",
+                                "accn": "0000320193-24-000100",
+                                "start": "2023-10-01",
+                                "end": "2024-09-30",
+                                "filed": "2024-11-01",
+                            }
+                        ]
+                    }
+                },
+                "Revenues": {
+                    "units": {
+                        "USD": [
+                            {
+                                "val": 350000000,
+                                "form": "10-K",
+                                "accn": "0000320193-24-000100",
+                                "start": "2023-10-01",
+                                "end": "2024-09-30",
+                                "filed": "2024-11-01",
+                            }
+                        ]
+                    }
+                },
+            }
+        },
+    }
+    res = select_financial_fact(MOCK_AAPL_MANIFEST_RECORD, "revenue", facts_conflicting)
+    assert res["status"] == "ambiguous"
+    assert res["value"] is None
+    assert "Conflicting candidate values" in res["reason"]
+
+
+def test_fact_10_incorrect_currency_or_unit() -> None:
+    """Test 10: Non-USD currency or unit rejection."""
+    facts_eur = {
+        "cik": 320193,
+        "entityName": "Apple Inc.",
+        "facts": {
+            "us-gaap": {
+                "Assets": {
+                    "units": {
+                        "EUR": [
+                            {
+                                "val": 300000000,
+                                "form": "10-K",
+                                "accn": "0000320193-24-000100",
+                                "end": "2024-09-30",
+                                "filed": "2024-11-01",
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+    }
+    res = select_financial_fact(MOCK_AAPL_MANIFEST_RECORD, "assets", facts_eur)
+    assert res["status"] == "missing"
+    assert res["value"] is None
+
+
+def test_fact_11_original_filing_accession_selection() -> None:
+    """Test 11: Original filing accession selection ignores amended accession."""
+    facts_with_amendment = {
+        "cik": 320193,
+        "entityName": "Apple Inc.",
+        "facts": {
+            "us-gaap": {
+                "Assets": {
+                    "units": {
+                        "USD": [
+                            {
+                                "val": 364980000000,
+                                "form": "10-K",
+                                "accn": "0000320193-24-000100",
+                                "end": "2024-09-30",
+                                "filed": "2024-11-01",
+                            },
+                            {
+                                "val": 999999999999,
+                                "form": "10-K",
+                                "accn": "0000320193-25-000999",
+                                "end": "2024-09-30",
+                                "filed": "2025-02-01",
+                            },
+                        ]
+                    }
+                }
+            }
+        },
+    }
+    res = select_financial_fact(MOCK_AAPL_MANIFEST_RECORD, "assets", facts_with_amendment)
+    assert res["status"] == "found"
+    assert res["value"] == 364980000000
+    assert res["accession"] == "0000320193-24-000100"
+
+
+def test_fact_12_normalize_panel_facts_complete_450_records(tmp_path: Path) -> None:
+    """Test 12: Correct creation of 450 output records from a complete mocked panel."""
+    raw_dir = tmp_path / "raw"
+    companyfacts_dir = raw_dir / "companyfacts"
+    companyfacts_dir.mkdir(parents=True)
+
+    manifest_records = []
+    for sector, tickers in COMPANY_PANEL.items():
+        for ticker in tickers:
+            cik_int = hash(ticker) % 900000 + 100000
+            cik_str = f"{cik_int:010d}"
+            if ticker == "XOM":
+                cik_str = "0000034088"
+
+            for fy in [2023, 2024, 2025]:
+                accn = f"{cik_str}-{str(fy)[2:]}-000001"
+                rep_date = f"{fy}-12-31"
+                manifest_records.append(
+                    {
+                        "ticker": ticker,
+                        "company_name": f"{ticker} Inc",
+                        "cik": cik_str,
+                        "sector": sector,
+                        "target_fiscal_year": fy,
+                        "fiscal_year_status": "confirmed",
+                        "form": "10-K",
+                        "accession_number": accn,
+                        "filing_date": f"{fy+1}-02-15",
+                        "report_date": rep_date,
+                        "primary_document": f"{ticker.lower()}-{fy}.htm",
+                        "source_url": f"https://www.sec.gov/{accn}",
+                    }
+                )
+
+            # Generate mocked company facts for this company
+            c_facts = {
+                "cik": int(cik_str),
+                "entityName": f"{ticker} Inc",
+                "facts": {
+                    "us-gaap": {
+                        "Assets": {
+                            "units": {
+                                "USD": [
+                                    {
+                                        "val": 1000000,
+                                        "form": "10-K",
+                                        "fp": "FY",
+                                        "fy": fy,
+                                        "accn": f"{cik_str}-{str(fy)[2:]}-000001",
+                                        "end": f"{fy}-12-31",
+                                        "filed": f"{fy+1}-02-15",
+                                    }
+                                    for fy in [2023, 2024, 2025]
+                                ]
+                            }
+                        },
+                        "NetIncomeLoss": {
+                            "units": {
+                                "USD": [
+                                    {
+                                        "val": 50000,
+                                        "form": "10-K",
+                                        "fp": "FY",
+                                        "fy": fy,
+                                        "accn": f"{cik_str}-{str(fy)[2:]}-000001",
+                                        "start": f"{fy}-01-01",
+                                        "end": f"{fy}-12-31",
+                                        "filed": f"{fy+1}-02-15",
+                                    }
+                                    for fy in [2023, 2024, 2025]
+                                ]
+                            }
+                        },
+                    }
+                },
+            }
+            facts_file = companyfacts_dir / f"CIK{cik_str}.json"
+            facts_file.write_text(json.dumps(c_facts), encoding="utf-8")
+
+    manifest_path = tmp_path / "filing_manifest.json"
+    manifest_path.write_text(json.dumps(manifest_records), encoding="utf-8")
+
+    out_file = tmp_path / "facts.jsonl"
+    summary = normalize_panel_facts(
+        manifest_path=manifest_path,
+        cache_dir=raw_dir,
+        output_path=out_file,
+    )
+
+    assert summary["companies_processed"] == 30
+    assert summary["fiscal_year_records_processed"] == 90
+    assert summary["total_metric_records"] == 450
+    assert summary["found_records"] == 180  # assets (90) + net_income (90)
+    assert summary["missing_records"] == 270  # liabilities (90) + operating_income (90) + revenue (90)
+    assert summary["ambiguous_records"] == 0
+
+    assert out_file.is_file()
+    lines = [json.loads(line) for line in out_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(lines) == 450
+
+    seen_keys = set()
+    for row in lines:
+        key = (row["ticker"], row["fiscal_year"], row["metric"])
+        assert key not in seen_keys
+        seen_keys.add(key)
+    assert len(seen_keys) == 450
+
+
+def test_manifest_validation(tmp_path: Path) -> None:
+    """Verify load_filing_manifest enforces all validation rules."""
+    # Test valid manifest
+    manifest_records = []
+    for sector, tickers in COMPANY_PANEL.items():
+        for ticker in tickers:
+            cik_str = "0000034088" if ticker == "XOM" else f"{hash(ticker)%900000+100000:010d}"
+            for fy in [2023, 2024, 2025]:
+                manifest_records.append(
+                    {
+                        "ticker": ticker,
+                        "company_name": f"{ticker} Inc",
+                        "cik": cik_str,
+                        "sector": sector,
+                        "target_fiscal_year": fy,
+                        "fiscal_year_status": "confirmed",
+                        "form": "10-K",
+                        "accession_number": f"{cik_str}-{str(fy)[2:]}-000001",
+                        "filing_date": f"{fy+1}-02-15",
+                        "report_date": f"{fy}-12-31",
+                        "primary_document": f"{ticker.lower()}-{fy}.htm",
+                        "source_url": f"https://www.sec.gov/{cik_str}",
+                    }
+                )
+
+    valid_path = tmp_path / "valid_manifest.json"
+    valid_path.write_text(json.dumps(manifest_records), encoding="utf-8")
+    loaded = load_filing_manifest(valid_path)
+    assert len(loaded) == 90
+
+    # Test count mismatch (< 90)
+    short_path = tmp_path / "short_manifest.json"
+    short_path.write_text(json.dumps(manifest_records[:89]), encoding="utf-8")
+    with pytest.raises(ValueError) as exc1:
+        load_filing_manifest(short_path)
+    assert "90 records" in str(exc1.value)
+
+    # Test unconfirmed status
+    unconfirmed = [dict(r) for r in manifest_records]
+    unconfirmed[0]["fiscal_year_status"] = "needs_review"
+    unconfirmed_path = tmp_path / "unconfirmed_manifest.json"
+    unconfirmed_path.write_text(json.dumps(unconfirmed), encoding="utf-8")
+    with pytest.raises(ValueError) as exc2:
+        load_filing_manifest(unconfirmed_path)
+    assert "expected 'confirmed'" in str(exc2.value)
+
+
+def test_cli_normalize_facts(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """Test CLI execution for --normalize-facts flag."""
+    from src import sec_data
+
+    monkeypatch.setattr("sys.argv", ["sec_data", "--normalize-facts"])
+
+    dummy_summary = {
+        "companies_processed": 30,
+        "fiscal_year_records_processed": 90,
+        "total_metric_records": 450,
+        "found_records": 363,
+        "missing_records": 77,
+        "ambiguous_records": 10,
+        "counts_by_metric": {
+            "assets": {"found": 90, "missing": 0, "ambiguous": 0},
+            "liabilities": {"found": 66, "missing": 24, "ambiguous": 0},
+            "net_income": {"found": 88, "missing": 2, "ambiguous": 0},
+            "operating_income": {"found": 54, "missing": 36, "ambiguous": 0},
+            "revenue": {"found": 65, "missing": 15, "ambiguous": 10},
+        },
+        "output_path": "data/processed/facts.jsonl",
+    }
+
+    with patch.object(sec_data, "normalize_panel_facts", return_value=dummy_summary):
+        sec_data.main()
+
+    captured = capsys.readouterr()
+    assert "Companies processed: 30" in captured.out
+    assert "Fiscal-year records processed: 90" in captured.out
+    assert "Total metric records: 450" in captured.out
+    assert "Found records: 363" in captured.out
+    assert "Missing records: 77" in captured.out
+    assert "Ambiguous records: 10" in captured.out
+    assert "Counts by metric:" in captured.out
+    assert "assets: 90 found, 0 missing, 0 ambiguous" in captured.out
+    assert "revenue: 65 found, 15 missing, 10 ambiguous" in captured.out

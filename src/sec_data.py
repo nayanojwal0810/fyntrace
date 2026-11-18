@@ -1,6 +1,7 @@
 """SEC data client for retrieving company facts, submissions, and ticker mappings."""
 
 import argparse
+from datetime import datetime
 import json
 import os
 import re
@@ -43,6 +44,38 @@ HISTORICAL_PANEL_REGISTRANTS: dict[str, dict[str, str]] = {
         "cik": "0000034088",
         "company_name": "EXXON MOBIL CORP",
     }
+}
+
+FINANCIAL_METRICS: dict[str, dict[str, Any]] = {
+    "assets": {
+        "tags": ["Assets"],
+        "kind": "instant",
+        "unit": "USD",
+    },
+    "liabilities": {
+        "tags": ["Liabilities"],
+        "kind": "instant",
+        "unit": "USD",
+    },
+    "net_income": {
+        "tags": ["NetIncomeLoss"],
+        "kind": "duration",
+        "unit": "USD",
+    },
+    "operating_income": {
+        "tags": ["OperatingIncomeLoss"],
+        "kind": "duration",
+        "unit": "USD",
+    },
+    "revenue": {
+        "tags": [
+            "RevenueFromContractWithCustomerExcludingAssessedTax",
+            "Revenues",
+            "SalesRevenueNet",
+        ],
+        "kind": "duration",
+        "unit": "USD",
+    },
 }
 
 _PLACEHOLDER_SUBSTRINGS = (
@@ -753,6 +786,302 @@ def collect_panel_data(
     return summary
 
 
+def load_filing_manifest(manifest_path: Path | None = None) -> list[dict[str, Any]]:
+    """Load and validate the filing manifest from disk.
+
+    Validates:
+    - Exactly 90 records.
+    - Exactly 30 unique companies.
+    - Three target fiscal years per company: 2023, 2024, 2025.
+    - No duplicate company-year combinations.
+    - Every selected filing has a valid accession number, CIK, filing date, and report date.
+    - All records have 'confirmed' status.
+    """
+    path = Path(manifest_path) if manifest_path is not None else (PROCESSED_DATA_DIR / "filing_manifest.json")
+    if not path.is_file():
+        raise FileNotFoundError(f"Filing manifest file not found at {path}")
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            records = json.load(f)
+    except Exception as exc:
+        raise ValueError(f"Failed to read filing manifest from {path}: {exc}") from exc
+
+    if not isinstance(records, list):
+        raise ValueError("Invalid filing manifest: expected a JSON array.")
+
+    if len(records) != 90:
+        raise ValueError(f"Filing manifest must contain exactly 90 records, got {len(records)}.")
+
+    seen_companies: set[str] = set()
+    seen_company_years: set[tuple[str, int]] = set()
+    company_years: dict[str, set[int]] = {}
+
+    for rec in records:
+        if not isinstance(rec, dict):
+            raise ValueError("Manifest record must be a JSON object.")
+        ticker = rec.get("ticker")
+        fy = rec.get("target_fiscal_year")
+        status = rec.get("fiscal_year_status")
+        accn = rec.get("accession_number")
+        cik = rec.get("cik")
+        filing_date = rec.get("filing_date")
+        report_date = rec.get("report_date")
+
+        if not ticker or not isinstance(ticker, str):
+            raise ValueError("Manifest record missing valid 'ticker'.")
+        if not isinstance(fy, int):
+            raise ValueError(f"Manifest record for '{ticker}' missing valid integer 'target_fiscal_year'.")
+        if status != "confirmed":
+            raise ValueError(f"Manifest record for '{ticker}' FY{fy} status is '{status}', expected 'confirmed'.")
+        if not accn or not isinstance(accn, str):
+            raise ValueError(f"Manifest record for '{ticker}' FY{fy} missing valid 'accession_number'.")
+        if not cik:
+            raise ValueError(f"Manifest record for '{ticker}' FY{fy} missing valid 'cik'.")
+        if not filing_date or not isinstance(filing_date, str):
+            raise ValueError(f"Manifest record for '{ticker}' FY{fy} missing valid 'filing_date'.")
+        if not report_date or not isinstance(report_date, str):
+            raise ValueError(f"Manifest record for '{ticker}' FY{fy} missing valid 'report_date'.")
+
+        pair = (ticker, fy)
+        if pair in seen_company_years:
+            raise ValueError(f"Duplicate company-year in manifest: {pair}")
+        seen_company_years.add(pair)
+        seen_companies.add(ticker)
+        company_years.setdefault(ticker, set()).add(fy)
+
+    if len(seen_companies) != 30:
+        raise ValueError(f"Filing manifest must contain exactly 30 unique companies, got {len(seen_companies)}.")
+
+    for ticker, years in company_years.items():
+        if years != {2023, 2024, 2025}:
+            raise ValueError(
+                f"Company '{ticker}' does not have target fiscal years 2023, 2024, 2025: got {sorted(years)}."
+            )
+
+    return records
+
+
+def select_financial_fact(
+    manifest_record: dict[str, Any],
+    metric_name: str,
+    facts_data: dict[str, Any],
+    as_of: str = COLLECTION_CUTOFF_DATE,
+) -> dict[str, Any]:
+    """Select and normalize a single financial fact for a company filing record."""
+    if metric_name not in FINANCIAL_METRICS:
+        raise ValueError(f"Unknown metric '{metric_name}'. Must be one of {list(FINANCIAL_METRICS.keys())}.")
+
+    metric_config = FINANCIAL_METRICS[metric_name]
+    candidate_tags: list[str] = metric_config["tags"]
+    kind: str = metric_config["kind"]
+    target_unit: str = metric_config["unit"]
+
+    base_record: dict[str, Any] = {
+        "ticker": manifest_record["ticker"],
+        "company_name": manifest_record["company_name"],
+        "cik": manifest_record["cik"],
+        "sector": manifest_record["sector"],
+        "fiscal_year": manifest_record["target_fiscal_year"],
+        "metric": metric_name,
+        "status": "missing",
+        "value": None,
+        "unit": target_unit,
+        "taxonomy": "us-gaap",
+        "tag": None,
+        "period_start": None,
+        "period_end": manifest_record.get("report_date"),
+        "filed_date": manifest_record.get("filing_date"),
+        "form": manifest_record.get("form") or "10-K",
+        "accession": manifest_record.get("accession_number"),
+        "source_url": manifest_record.get("source_url") or "",
+        "selection_policy": "original_filing",
+        "reason": None,
+    }
+
+    facts_dict = facts_data.get("facts", {}) if isinstance(facts_data, dict) else {}
+    us_gaap = facts_dict.get("us-gaap", {}) if isinstance(facts_dict, dict) else {}
+    if not isinstance(us_gaap, dict):
+        base_record["reason"] = "No US-GAAP concepts in company facts"
+        return base_record
+
+    target_accn = manifest_record.get("accession_number")
+    target_report_date = manifest_record.get("report_date")
+
+    candidates: list[dict[str, Any]] = []
+
+    for tag in candidate_tags:
+        concept_data = us_gaap.get(tag)
+        if not isinstance(concept_data, dict):
+            continue
+        units_dict = concept_data.get("units", {})
+        if not isinstance(units_dict, dict):
+            continue
+        rows = units_dict.get(target_unit, [])
+        if not isinstance(rows, list):
+            continue
+
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if row.get("form") != "10-K":
+                continue
+            if row.get("accn") != target_accn:
+                continue
+            row_filed = row.get("filed")
+            if row_filed and as_of and str(row_filed) > as_of:
+                continue
+            row_end = row.get("end")
+            if not row_end or row_end != target_report_date:
+                continue
+
+            row_start = row.get("start")
+            if kind == "duration":
+                if not row_start:
+                    continue
+                try:
+                    d_start = datetime.strptime(row_start, "%Y-%m-%d")
+                    d_end = datetime.strptime(row_end, "%Y-%m-%d")
+                    duration_days = (d_end - d_start).days
+                except (ValueError, TypeError):
+                    continue
+                if not (330 <= duration_days <= 400):
+                    continue
+            elif kind == "instant":
+                # For instant metrics, start date is not required
+                pass
+
+            val = row.get("val")
+            if val is None:
+                continue
+
+            candidates.append(
+                {
+                    "tag": tag,
+                    "val": val,
+                    "start": row_start if kind == "duration" else None,
+                    "end": row_end,
+                    "filed": row_filed or manifest_record.get("filing_date"),
+                    "accn": row.get("accn"),
+                }
+            )
+
+    # Remove duplicate equivalent records (same tag, value, period, accession)
+    unique_candidates: list[dict[str, Any]] = []
+    seen_keys: set[tuple[Any, ...]] = set()
+    for c in candidates:
+        key = (c["tag"], c["val"], c["start"], c["end"], c["accn"])
+        if key not in seen_keys:
+            seen_keys.add(key)
+            unique_candidates.append(c)
+
+    if not unique_candidates:
+        base_record["status"] = "missing"
+        base_record["reason"] = f"No matching 10-K facts found for tags: {candidate_tags}"
+        return base_record
+
+    distinct_vals = {c["val"] for c in unique_candidates}
+    if len(distinct_vals) == 1:
+        # All candidates agree on value!
+        # Pick preferred candidate according to candidate_tags order
+        unique_candidates.sort(key=lambda x: candidate_tags.index(x["tag"]))
+        chosen = unique_candidates[0]
+        base_record["status"] = "found"
+        base_record["value"] = chosen["val"]
+        base_record["tag"] = chosen["tag"]
+        base_record["period_start"] = chosen["start"]
+        base_record["period_end"] = chosen["end"]
+        base_record["filed_date"] = chosen["filed"]
+        base_record["reason"] = None
+        return base_record
+
+    # Multiple candidates disagree on value
+    base_record["status"] = "ambiguous"
+    vals_summary = {c["tag"]: c["val"] for c in unique_candidates}
+    base_record["reason"] = f"Conflicting candidate values found: {vals_summary}"
+    return base_record
+
+
+def normalize_panel_facts(
+    manifest_path: Path | None = None,
+    cache_dir: Path | None = None,
+    output_path: Path | None = None,
+    as_of: str = COLLECTION_CUTOFF_DATE,
+) -> dict[str, Any]:
+    """Normalize annual financial facts for panel companies and write facts.jsonl."""
+    raw_dir = Path(cache_dir) if cache_dir is not None else RAW_DATA_DIR
+    out_file = Path(output_path) if output_path is not None else (PROCESSED_DATA_DIR / "facts.jsonl")
+
+    manifest = load_filing_manifest(manifest_path)
+
+    # Cache companyfacts in-memory during extraction
+    loaded_facts: dict[str, dict[str, Any]] = {}
+
+    all_fact_records: list[dict[str, Any]] = []
+    unique_tickers: set[str] = set()
+
+    for manifest_rec in manifest:
+        ticker = manifest_rec["ticker"]
+        unique_tickers.add(ticker)
+        cik = manifest_rec["cik"]
+
+        if cik not in loaded_facts:
+            facts_file = raw_dir / "companyfacts" / f"CIK{cik}.json"
+            if facts_file.is_file():
+                try:
+                    with open(facts_file, "r", encoding="utf-8") as f:
+                        loaded_facts[cik] = json.load(f)
+                except Exception as exc:
+                    raise ValueError(f"Failed to read company facts from {facts_file}: {exc}") from exc
+            else:
+                loaded_facts[cik] = get_companyfacts(cik, cache_dir=raw_dir)
+
+        facts_data = loaded_facts[cik]
+
+        for metric_name in FINANCIAL_METRICS:
+            fact_rec = select_financial_fact(manifest_rec, metric_name, facts_data, as_of=as_of)
+            all_fact_records.append(fact_rec)
+
+    # Write out_file atomically
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = out_file.with_suffix(".tmp")
+    try:
+        with open(temp_path, "w", encoding="utf-8") as f:
+            for rec in all_fact_records:
+                f.write(json.dumps(rec) + "\n")
+        os.replace(temp_path, out_file)
+    finally:
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+
+    found_count = sum(1 for r in all_fact_records if r["status"] == "found")
+    missing_count = sum(1 for r in all_fact_records if r["status"] == "missing")
+    ambiguous_count = sum(1 for r in all_fact_records if r["status"] == "ambiguous")
+
+    counts_by_metric: dict[str, dict[str, int]] = {}
+    for metric_name in FINANCIAL_METRICS:
+        m_records = [r for r in all_fact_records if r["metric"] == metric_name]
+        counts_by_metric[metric_name] = {
+            "found": sum(1 for r in m_records if r["status"] == "found"),
+            "missing": sum(1 for r in m_records if r["status"] == "missing"),
+            "ambiguous": sum(1 for r in m_records if r["status"] == "ambiguous"),
+        }
+
+    return {
+        "companies_processed": len(unique_tickers),
+        "fiscal_year_records_processed": len(manifest),
+        "total_metric_records": len(all_fact_records),
+        "found_records": found_count,
+        "missing_records": missing_count,
+        "ambiguous_records": ambiguous_count,
+        "counts_by_metric": counts_by_metric,
+        "output_path": str(out_file),
+    }
+
+
 def main() -> None:
     """CLI entrypoint for verifying ticker resolution and company facts or panel collection."""
     parser = argparse.ArgumentParser(description="SEC data client CLI")
@@ -763,7 +1092,30 @@ def main() -> None:
         action="store_true",
         help="Collect data and generate annual filing manifest for the 30-company panel",
     )
+    group.add_argument(
+        "--normalize-facts",
+        action="store_true",
+        help="Normalize annual financial facts from cached SEC data",
+    )
     args = parser.parse_args()
+
+    if args.normalize_facts:
+        try:
+            summary = normalize_panel_facts()
+        except Exception as exc:
+            sys.stderr.write(f"Error normalizing financial facts: {exc}\n")
+            sys.exit(1)
+
+        print(f"Companies processed: {summary['companies_processed']}")
+        print(f"Fiscal-year records processed: {summary['fiscal_year_records_processed']}")
+        print(f"Total metric records: {summary['total_metric_records']}")
+        print(f"Found records: {summary['found_records']}")
+        print(f"Missing records: {summary['missing_records']}")
+        print(f"Ambiguous records: {summary['ambiguous_records']}")
+        print("Counts by metric:")
+        for metric, counts in summary["counts_by_metric"].items():
+            print(f"  {metric}: {counts['found']} found, {counts['missing']} missing, {counts['ambiguous']} ambiguous")
+        return
 
     try:
         session = make_sec_session()
