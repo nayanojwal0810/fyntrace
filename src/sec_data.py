@@ -78,6 +78,28 @@ FINANCIAL_METRICS: dict[str, dict[str, Any]] = {
     },
 }
 
+VERIFIED_COMPREHENSIVE_REVENUE_TAGS: dict[tuple[str, int], list[str]] = {
+    ("PFE", 2023): ["Revenues"],
+    ("CVX", 2023): ["Revenues"],
+    ("CVX", 2024): ["Revenues"],
+    ("CVX", 2025): ["Revenues"],
+    ("COP", 2023): ["Revenues"],
+    ("COP", 2024): ["Revenues"],
+    ("COP", 2025): ["Revenues"],
+    ("WMT", 2023): ["Revenues"],
+    ("WMT", 2024): ["Revenues"],
+    ("WMT", 2025): ["Revenues"],
+}
+
+COMPANY_SPECIFIC_REVENUE_TAGS: dict[tuple[str, int], list[str]] = {
+    **{(ticker, fy): ["RevenuesNetOfInterestExpense"]
+       for ticker in ("GS", "MS", "WFC")
+       for fy in (2023, 2024, 2025)},
+    **{(ticker, fy): ["RegulatedAndUnregulatedOperatingRevenue"]
+       for ticker in ("DUK", "NEE")
+       for fy in (2023, 2024, 2025)},
+}
+
 _PLACEHOLDER_SUBSTRINGS = (
     "yourrealname",
     "your-real-email",
@@ -872,10 +894,25 @@ def select_financial_fact(
     if metric_name not in FINANCIAL_METRICS:
         raise ValueError(f"Unknown metric '{metric_name}'. Must be one of {list(FINANCIAL_METRICS.keys())}.")
 
+    ticker = manifest_record.get("ticker", "")
+    fy = manifest_record.get("target_fiscal_year")
+    pair = (ticker, fy)
+
     metric_config = FINANCIAL_METRICS[metric_name]
-    candidate_tags: list[str] = metric_config["tags"]
     kind: str = metric_config["kind"]
     target_unit: str = metric_config["unit"]
+
+    is_verified_revenue = False
+    if metric_name == "revenue":
+        if pair in VERIFIED_COMPREHENSIVE_REVENUE_TAGS:
+            candidate_tags = list(VERIFIED_COMPREHENSIVE_REVENUE_TAGS[pair])
+            is_verified_revenue = True
+        elif pair in COMPANY_SPECIFIC_REVENUE_TAGS:
+            candidate_tags = list(metric_config["tags"]) + list(COMPANY_SPECIFIC_REVENUE_TAGS[pair])
+        else:
+            candidate_tags = list(metric_config["tags"])
+    else:
+        candidate_tags = list(metric_config["tags"])
 
     base_record: dict[str, Any] = {
         "ticker": manifest_record["ticker"],
@@ -977,7 +1014,10 @@ def select_financial_fact(
 
     if not unique_candidates:
         base_record["status"] = "missing"
-        base_record["reason"] = f"No matching 10-K facts found for tags: {candidate_tags}"
+        if is_verified_revenue:
+            base_record["reason"] = f"Verified comprehensive revenue tag '{candidate_tags[0]}' not found in 10-K filing"
+        else:
+            base_record["reason"] = f"No matching 10-K facts found for tags: {candidate_tags}"
         return base_record
 
     distinct_vals = {c["val"] for c in unique_candidates}

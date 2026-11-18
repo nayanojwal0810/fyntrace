@@ -10,10 +10,12 @@ import requests
 from src.sec_data import (
     COLLECTION_CUTOFF_DATE,
     COMPANY_PANEL,
+    COMPANY_SPECIFIC_REVENUE_TAGS,
     FINANCIAL_METRICS,
     HISTORICAL_PANEL_REGISTRANTS,
     PANEL_TICKERS,
     TARGET_FISCAL_YEARS,
+    VERIFIED_COMPREHENSIVE_REVENUE_TAGS,
     collect_panel_data,
     extract_xbrl_10k_fiscal_years,
     filing_url,
@@ -1408,3 +1410,562 @@ def test_cli_normalize_facts(monkeypatch: pytest.MonkeyPatch, capsys: pytest.Cap
     assert "Counts by metric:" in captured.out
     assert "assets: 90 found, 0 missing, 0 ambiguous" in captured.out
     assert "revenue: 65 found, 15 missing, 10 ambiguous" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# Tests for verified revenue concepts and tags
+# ---------------------------------------------------------------------------
+
+
+def test_pfe_fy2023_prefers_verified_total_revenues() -> None:
+    """1. PFE FY2023 prefers verified total Revenues over contract revenue."""
+    manifest_pfe = {
+        "ticker": "PFE",
+        "company_name": "PFIZER INC",
+        "cik": "0000078003",
+        "sector": "Healthcare",
+        "target_fiscal_year": 2023,
+        "fiscal_year_status": "confirmed",
+        "form": "10-K",
+        "accession_number": "0000078003-24-000039",
+        "filing_date": "2024-02-22",
+        "report_date": "2023-12-31",
+        "primary_document": "pfe-20231231.htm",
+        "source_url": "https://www.sec.gov/Archives/edgar/data/78003/000007800324000039/pfe-20231231.htm",
+    }
+    facts = {
+        "cik": 78003,
+        "entityName": "PFIZER INC",
+        "facts": {
+            "us-gaap": {
+                "RevenueFromContractWithCustomerExcludingAssessedTax": {
+                    "units": {
+                        "USD": [
+                            {
+                                "val": 50000000000,
+                                "form": "10-K",
+                                "accn": "0000078003-24-000039",
+                                "start": "2023-01-01",
+                                "end": "2023-12-31",
+                                "filed": "2024-02-22",
+                            }
+                        ]
+                    }
+                },
+                "Revenues": {
+                    "units": {
+                        "USD": [
+                            {
+                                "val": 58496000000,
+                                "form": "10-K",
+                                "accn": "0000078003-24-000039",
+                                "start": "2023-01-01",
+                                "end": "2023-12-31",
+                                "filed": "2024-02-22",
+                            }
+                        ]
+                    }
+                },
+            }
+        },
+    }
+    res = select_financial_fact(manifest_pfe, "revenue", facts)
+    assert res["status"] == "found"
+    assert res["value"] == 58496000000
+    assert res["tag"] == "Revenues"
+    assert res["accession"] == "0000078003-24-000039"
+
+
+def test_wmt_fy2024_chooses_comprehensive_revenue() -> None:
+    """2. WMT FY2024 chooses comprehensive revenue instead of smaller customer-contract component."""
+    manifest_wmt = {
+        "ticker": "WMT",
+        "company_name": "Walmart Inc.",
+        "cik": "0000104169",
+        "sector": "Consumer",
+        "target_fiscal_year": 2024,
+        "fiscal_year_status": "confirmed",
+        "form": "10-K",
+        "accession_number": "0000104169-24-000056",
+        "filing_date": "2024-03-22",
+        "report_date": "2024-01-31",
+        "primary_document": "wmt-20240131.htm",
+        "source_url": "https://www.sec.gov/Archives/edgar/data/104169/000010416924000056/wmt-20240131.htm",
+    }
+    facts = {
+        "cik": 104169,
+        "entityName": "Walmart Inc.",
+        "facts": {
+            "us-gaap": {
+                "RevenueFromContractWithCustomerExcludingAssessedTax": {
+                    "units": {
+                        "USD": [
+                            {
+                                "val": 642637000000,
+                                "form": "10-K",
+                                "accn": "0000104169-24-000056",
+                                "start": "2023-02-01",
+                                "end": "2024-01-31",
+                                "filed": "2024-03-22",
+                            }
+                        ]
+                    }
+                },
+                "Revenues": {
+                    "units": {
+                        "USD": [
+                            {
+                                "val": 648125000000,
+                                "form": "10-K",
+                                "accn": "0000104169-24-000056",
+                                "start": "2023-02-01",
+                                "end": "2024-01-31",
+                                "filed": "2024-03-22",
+                            }
+                        ]
+                    }
+                },
+            }
+        },
+    }
+    res = select_financial_fact(manifest_wmt, "revenue", facts)
+    assert res["status"] == "found"
+    assert res["value"] == 648125000000
+    assert res["tag"] == "Revenues"
+
+
+@pytest.mark.parametrize(
+    "ticker,cik,accn,val",
+    [
+        ("CVX", "0000093410", "0000093410-25-000009", 202792000000),
+        ("COP", "0001163165", "0001163165-25-000012", 54745000000),
+    ],
+)
+def test_cvx_and_cop_preserve_correct_source_accession_and_periods(
+    ticker: str, cik: str, accn: str, val: int
+) -> None:
+    """3. CVX and COP preserve correct source accession and reporting periods."""
+    manifest_rec = {
+        "ticker": ticker,
+        "company_name": f"{ticker} Corp",
+        "cik": cik,
+        "sector": "Energy and utilities",
+        "target_fiscal_year": 2024,
+        "fiscal_year_status": "confirmed",
+        "form": "10-K",
+        "accession_number": accn,
+        "filing_date": "2025-02-20",
+        "report_date": "2024-12-31",
+        "primary_document": f"{ticker.lower()}-20241231.htm",
+        "source_url": f"https://www.sec.gov/{accn}",
+    }
+    facts = {
+        "cik": int(cik),
+        "entityName": f"{ticker} Corp",
+        "facts": {
+            "us-gaap": {
+                "Revenues": {
+                    "units": {
+                        "USD": [
+                            # Quarterly period (should be filtered out)
+                            {
+                                "val": 12345000000,
+                                "form": "10-K",
+                                "accn": accn,
+                                "start": "2024-10-01",
+                                "end": "2024-12-31",
+                                "filed": "2025-02-20",
+                            },
+                            # Different accession (should be filtered out)
+                            {
+                                "val": 999999000000,
+                                "form": "10-K",
+                                "accn": f"{cik}-25-999999",
+                                "start": "2024-01-01",
+                                "end": "2024-12-31",
+                                "filed": "2025-02-20",
+                            },
+                            # Correct full-year matching accession
+                            {
+                                "val": val,
+                                "form": "10-K",
+                                "accn": accn,
+                                "start": "2024-01-01",
+                                "end": "2024-12-31",
+                                "filed": "2025-02-20",
+                            },
+                        ]
+                    }
+                }
+            }
+        },
+    }
+    res = select_financial_fact(manifest_rec, "revenue", facts)
+    assert res["status"] == "found"
+    assert res["value"] == val
+    assert res["accession"] == accn
+    assert res["tag"] == "Revenues"
+
+
+def test_non_approved_company_with_conflicting_revenue_tags_remains_ambiguous() -> None:
+    """4. A non-approved company with conflicting revenue tags remains ambiguous."""
+    manifest_unapproved = {
+        "ticker": "AAPL",
+        "company_name": "Apple Inc.",
+        "cik": "0000320193",
+        "sector": "Technology",
+        "target_fiscal_year": 2024,
+        "fiscal_year_status": "confirmed",
+        "form": "10-K",
+        "accession_number": "0000320193-24-000100",
+        "filing_date": "2024-11-01",
+        "report_date": "2024-09-30",
+        "primary_document": "aapl-20240930.htm",
+        "source_url": "https://www.sec.gov/Archives/edgar/data/320193/000032019324000100/aapl-20240930.htm",
+    }
+    facts = {
+        "cik": 320193,
+        "entityName": "Apple Inc.",
+        "facts": {
+            "us-gaap": {
+                "RevenueFromContractWithCustomerExcludingAssessedTax": {
+                    "units": {
+                        "USD": [
+                            {
+                                "val": 391035000000,
+                                "form": "10-K",
+                                "accn": "0000320193-24-000100",
+                                "start": "2023-10-01",
+                                "end": "2024-09-30",
+                                "filed": "2024-11-01",
+                            }
+                        ]
+                    }
+                },
+                "Revenues": {
+                    "units": {
+                        "USD": [
+                            {
+                                "val": 395000000000,
+                                "form": "10-K",
+                                "accn": "0000320193-24-000100",
+                                "start": "2023-10-01",
+                                "end": "2024-09-30",
+                                "filed": "2024-11-01",
+                            }
+                        ]
+                    }
+                },
+            }
+        },
+    }
+    res = select_financial_fact(manifest_unapproved, "revenue", facts)
+    assert res["status"] == "ambiguous"
+    assert res["value"] is None
+    assert "Conflicting candidate values" in res["reason"]
+
+
+def test_conflicting_values_under_same_preferred_tag_remain_ambiguous() -> None:
+    """5. Conflicting values under the same preferred tag remain ambiguous."""
+    manifest_pfe = {
+        "ticker": "PFE",
+        "company_name": "PFIZER INC",
+        "cik": "0000078003",
+        "sector": "Healthcare",
+        "target_fiscal_year": 2023,
+        "fiscal_year_status": "confirmed",
+        "form": "10-K",
+        "accession_number": "0000078003-24-000039",
+        "filing_date": "2024-02-22",
+        "report_date": "2023-12-31",
+        "primary_document": "pfe-20231231.htm",
+        "source_url": "https://www.sec.gov/Archives/edgar/data/78003/000007800324000039/pfe-20231231.htm",
+    }
+    facts = {
+        "cik": 78003,
+        "entityName": "PFIZER INC",
+        "facts": {
+            "us-gaap": {
+                "Revenues": {
+                    "units": {
+                        "USD": [
+                            {
+                                "val": 58496000000,
+                                "form": "10-K",
+                                "accn": "0000078003-24-000039",
+                                "start": "2023-01-01",
+                                "end": "2023-12-31",
+                                "filed": "2024-02-22",
+                            },
+                            {
+                                "val": 59000000000,
+                                "form": "10-K",
+                                "accn": "0000078003-24-000039",
+                                "start": "2023-01-01",
+                                "end": "2023-12-31",
+                                "filed": "2024-02-22",
+                            },
+                        ]
+                    }
+                }
+            }
+        },
+    }
+    res = select_financial_fact(manifest_pfe, "revenue", facts)
+    assert res["status"] == "ambiguous"
+    assert res["value"] is None
+    assert "Conflicting candidate values" in res["reason"]
+
+
+def test_missing_preferred_comprehensive_revenue_does_not_silently_return_partial_revenue() -> None:
+    """6. Missing preferred comprehensive revenue does not silently return partial revenue."""
+    manifest_pfe = {
+        "ticker": "PFE",
+        "company_name": "PFIZER INC",
+        "cik": "0000078003",
+        "sector": "Healthcare",
+        "target_fiscal_year": 2023,
+        "fiscal_year_status": "confirmed",
+        "form": "10-K",
+        "accession_number": "0000078003-24-000039",
+        "filing_date": "2024-02-22",
+        "report_date": "2023-12-31",
+        "primary_document": "pfe-20231231.htm",
+        "source_url": "https://www.sec.gov/Archives/edgar/data/78003/000007800324000039/pfe-20231231.htm",
+    }
+    facts = {
+        "cik": 78003,
+        "entityName": "PFIZER INC",
+        "facts": {
+            "us-gaap": {
+                "RevenueFromContractWithCustomerExcludingAssessedTax": {
+                    "units": {
+                        "USD": [
+                            {
+                                "val": 50000000000,
+                                "form": "10-K",
+                                "accn": "0000078003-24-000039",
+                                "start": "2023-01-01",
+                                "end": "2023-12-31",
+                                "filed": "2024-02-22",
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+    }
+    res = select_financial_fact(manifest_pfe, "revenue", facts)
+    assert res["status"] == "missing"
+    assert res["value"] is None
+    assert "Verified comprehensive revenue tag" in res["reason"]
+
+
+@pytest.mark.parametrize(
+    "ticker,cik,accn,val",
+    [
+        ("GS", "0000886982", "0000886982-25-000005", 53512000000),
+        ("MS", "0000895421", "0000895421-25-000304", 61761000000),
+        ("WFC", "0000072971", "0000072971-25-000066", 82296000000),
+    ],
+)
+def test_banks_can_use_revenues_net_of_interest_expense(
+    ticker: str, cik: str, accn: str, val: int
+) -> None:
+    """7. GS, MS, and WFC can use RevenuesNetOfInterestExpense."""
+    manifest_bank = {
+        "ticker": ticker,
+        "company_name": f"{ticker} Inc",
+        "cik": cik,
+        "sector": "Financial services",
+        "target_fiscal_year": 2024,
+        "fiscal_year_status": "confirmed",
+        "form": "10-K",
+        "accession_number": accn,
+        "filing_date": "2025-02-25",
+        "report_date": "2024-12-31",
+        "primary_document": f"{ticker.lower()}-20241231.htm",
+        "source_url": f"https://www.sec.gov/{accn}",
+    }
+    facts = {
+        "cik": int(cik),
+        "entityName": f"{ticker} Inc",
+        "facts": {
+            "us-gaap": {
+                "RevenuesNetOfInterestExpense": {
+                    "units": {
+                        "USD": [
+                            {
+                                "val": val,
+                                "form": "10-K",
+                                "accn": accn,
+                                "start": "2024-01-01",
+                                "end": "2024-12-31",
+                                "filed": "2025-02-25",
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+    }
+    res = select_financial_fact(manifest_bank, "revenue", facts)
+    assert res["status"] == "found"
+    assert res["value"] == val
+    assert res["tag"] == "RevenuesNetOfInterestExpense"
+    assert res["accession"] == accn
+
+
+@pytest.mark.parametrize(
+    "ticker,cik,accn,val",
+    [
+        ("DUK", "0001326160", "0001326160-25-000072", 30357000000),
+        ("NEE", "0000753308", "0000753308-25-000011", 24753000000),
+    ],
+)
+def test_utilities_can_use_regulated_and_unregulated_operating_revenue(
+    ticker: str, cik: str, accn: str, val: int
+) -> None:
+    """8. DUK and NEE can use RegulatedAndUnregulatedOperatingRevenue."""
+    manifest_util = {
+        "ticker": ticker,
+        "company_name": f"{ticker} Corp",
+        "cik": cik,
+        "sector": "Energy and utilities",
+        "target_fiscal_year": 2024,
+        "fiscal_year_status": "confirmed",
+        "form": "10-K",
+        "accession_number": accn,
+        "filing_date": "2025-02-25",
+        "report_date": "2024-12-31",
+        "primary_document": f"{ticker.lower()}-20241231.htm",
+        "source_url": f"https://www.sec.gov/{accn}",
+    }
+    facts = {
+        "cik": int(cik),
+        "entityName": f"{ticker} Corp",
+        "facts": {
+            "us-gaap": {
+                "RegulatedAndUnregulatedOperatingRevenue": {
+                    "units": {
+                        "USD": [
+                            {
+                                "val": val,
+                                "form": "10-K",
+                                "accn": accn,
+                                "start": "2024-01-01",
+                                "end": "2024-12-31",
+                                "filed": "2025-02-25",
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+    }
+    res = select_financial_fact(manifest_util, "revenue", facts)
+    assert res["status"] == "found"
+    assert res["value"] == val
+    assert res["tag"] == "RegulatedAndUnregulatedOperatingRevenue"
+    assert res["accession"] == accn
+
+
+def test_new_concepts_not_automatically_used_for_unrelated_companies() -> None:
+    """9. The new concepts are not automatically used for unrelated companies."""
+    manifest_unrelated = {
+        "ticker": "AAPL",
+        "company_name": "Apple Inc.",
+        "cik": "0000320193",
+        "sector": "Technology",
+        "target_fiscal_year": 2024,
+        "fiscal_year_status": "confirmed",
+        "form": "10-K",
+        "accession_number": "0000320193-24-000100",
+        "filing_date": "2024-11-01",
+        "report_date": "2024-09-30",
+        "primary_document": "aapl-20240930.htm",
+        "source_url": "https://www.sec.gov/Archives/edgar/data/320193/000032019324000100/aapl-20240930.htm",
+    }
+    facts = {
+        "cik": 320193,
+        "entityName": "Apple Inc.",
+        "facts": {
+            "us-gaap": {
+                "RevenuesNetOfInterestExpense": {
+                    "units": {
+                        "USD": [
+                            {
+                                "val": 100000000,
+                                "form": "10-K",
+                                "accn": "0000320193-24-000100",
+                                "start": "2023-10-01",
+                                "end": "2024-09-30",
+                                "filed": "2024-11-01",
+                            }
+                        ]
+                    }
+                },
+                "RegulatedAndUnregulatedOperatingRevenue": {
+                    "units": {
+                        "USD": [
+                            {
+                                "val": 200000000,
+                                "form": "10-K",
+                                "accn": "0000320193-24-000100",
+                                "start": "2023-10-01",
+                                "end": "2024-09-30",
+                                "filed": "2024-11-01",
+                            }
+                        ]
+                    }
+                },
+            }
+        },
+    }
+    res = select_financial_fact(manifest_unrelated, "revenue", facts)
+    assert res["status"] == "missing"
+    assert res["value"] is None
+
+
+def test_so_net_income_remains_missing_when_only_profit_loss_exists() -> None:
+    """10. SO net income remains missing when only ProfitLoss exists."""
+    manifest_so = {
+        "ticker": "SO",
+        "company_name": "SOUTHERN CO",
+        "cik": "0000092122",
+        "sector": "Energy and utilities",
+        "target_fiscal_year": 2024,
+        "fiscal_year_status": "confirmed",
+        "form": "10-K",
+        "accession_number": "0000092122-25-000015",
+        "filing_date": "2025-02-19",
+        "report_date": "2024-12-31",
+        "primary_document": "so-20241231.htm",
+        "source_url": "https://www.sec.gov/Archives/edgar/data/92122/000009212225000015/so-20241231.htm",
+    }
+    facts_profit_loss_only = {
+        "cik": 92122,
+        "entityName": "SOUTHERN CO",
+        "facts": {
+            "us-gaap": {
+                "ProfitLoss": {
+                    "units": {
+                        "USD": [
+                            {
+                                "val": 4443000000,
+                                "form": "10-K",
+                                "accn": "0000092122-25-000015",
+                                "start": "2024-01-01",
+                                "end": "2024-12-31",
+                                "filed": "2025-02-19",
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+    }
+    res = select_financial_fact(manifest_so, "net_income", facts_profit_loss_only)
+    assert res["status"] == "missing"
+    assert res["value"] is None
+
