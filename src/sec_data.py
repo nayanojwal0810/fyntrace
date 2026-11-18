@@ -38,6 +38,13 @@ PANEL_TICKERS: dict[str, str] = {
     ticker: sector for sector, tickers in COMPANY_PANEL.items() for ticker in tickers
 }
 
+HISTORICAL_PANEL_REGISTRANTS: dict[str, dict[str, str]] = {
+    "XOM": {
+        "cik": "0000034088",
+        "company_name": "EXXON MOBIL CORP",
+    }
+}
+
 _PLACEHOLDER_SUBSTRINGS = (
     "yourrealname",
     "your-real-email",
@@ -681,9 +688,14 @@ def collect_panel_data(
         for ticker in tickers:
             companies_processed += 1
             try:
-                company = resolve_ticker(ticker, session=session, cache_dir=raw_dir)
-                cik = company["cik"]
-                company_name = company["company_name"]
+                if ticker in HISTORICAL_PANEL_REGISTRANTS:
+                    hist_info = HISTORICAL_PANEL_REGISTRANTS[ticker]
+                    cik = hist_info["cik"]
+                    company_name = hist_info["company_name"]
+                else:
+                    company = resolve_ticker(ticker, session=session, cache_dir=raw_dir)
+                    cik = company["cik"]
+                    company_name = company["company_name"]
 
                 get_submissions(cik, session=session, cache_dir=raw_dir)
                 get_companyfacts(cik, session=session, cache_dir=raw_dir)

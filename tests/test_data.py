@@ -10,6 +10,7 @@ import requests
 from src.sec_data import (
     COLLECTION_CUTOFF_DATE,
     COMPANY_PANEL,
+    HISTORICAL_PANEL_REGISTRANTS,
     PANEL_TICKERS,
     TARGET_FISCAL_YEARS,
     collect_panel_data,
@@ -563,7 +564,7 @@ def test_collect_panel_data_mocked(tmp_path: Path) -> None:
     }
     (raw_dir / "company_tickers.json").write_text(json.dumps(tickers_dict), encoding="utf-8")
 
-    # Mock submissions and facts
+    # Mock submissions and facts for standard CIK 0000789019
     sub_dir = raw_dir / "submissions"
     sub_dir.mkdir(parents=True)
     (sub_dir / "CIK0000789019.json").write_text(json.dumps(MOCK_SUBMISSIONS_PAYLOAD), encoding="utf-8")
@@ -571,6 +572,46 @@ def test_collect_panel_data_mocked(tmp_path: Path) -> None:
     facts_dir = raw_dir / "companyfacts"
     facts_dir.mkdir(parents=True)
     (facts_dir / "CIK0000789019.json").write_text(json.dumps(MOCK_FACTS_PAYLOAD), encoding="utf-8")
+
+    # Mock submissions and facts for XOM historical CIK 0000034088
+    xom_sub = {
+        "cik": "0000034088",
+        "entityType": "operating",
+        "name": "EXXON MOBIL CORP",
+        "filings": {
+            "recent": {
+                "accessionNumber": [
+                    "0000034088-26-000045",
+                    "0000034088-25-000010",
+                    "0000034088-24-000018",
+                ],
+                "form": ["10-K", "10-K", "10-K"],
+                "filingDate": ["2026-02-25", "2025-02-26", "2024-02-28"],
+                "reportDate": ["2025-12-31", "2024-12-31", "2023-12-31"],
+                "primaryDocument": ["xom-20251231.htm", "xom-20241231.htm", "xom-20231231.htm"],
+            }
+        },
+    }
+    (sub_dir / "CIK0000034088.json").write_text(json.dumps(xom_sub), encoding="utf-8")
+
+    xom_facts = {
+        "cik": 34088,
+        "entityName": "EXXON MOBIL CORP",
+        "facts": {
+            "us-gaap": {
+                "Revenues": {
+                    "units": {
+                        "USD": [
+                            {"form": "10-K", "fp": "FY", "fy": 2025, "accn": "0000034088-26-000045", "val": 300},
+                            {"form": "10-K", "fp": "FY", "fy": 2024, "accn": "0000034088-25-000010", "val": 200},
+                            {"form": "10-K", "fp": "FY", "fy": 2023, "accn": "0000034088-24-000018", "val": 100},
+                        ]
+                    }
+                }
+            }
+        },
+    }
+    (facts_dir / "CIK0000034088.json").write_text(json.dumps(xom_facts), encoding="utf-8")
 
     out_file = tmp_path / "processed" / "filing_manifest.json"
     mock_session = create_mock_session()
@@ -583,7 +624,113 @@ def test_collect_panel_data_mocked(tmp_path: Path) -> None:
 
     with open(out_file, "r", encoding="utf-8") as f:
         manifest = json.load(f)
-    assert len(manifest) == 90  # 30 companies * 3 years
+    assert len(manifest) == 90
+
+    # Verify XOM records in manifest use CIK 0000034088 and EXXON MOBIL CORP
+    xom_records = [r for r in manifest if r["ticker"] == "XOM"]
+    assert len(xom_records) == 3
+    for xr in xom_records:
+        assert xr["cik"] == "0000034088"
+        assert xr["company_name"] == "EXXON MOBIL CORP"
+        assert xr["fiscal_year_status"] == "confirmed"
+
+
+def test_xom_current_ticker_resolution_unchanged(tmp_path: Path) -> None:
+    """Verify resolve_ticker('XOM') returns current SEC mapping and is not overridden."""
+    tickers_payload = {
+        "0": {"cik_str": 2115436, "ticker": "XOM", "title": "ExxonMobil Holdings Corp"},
+    }
+    mock_session = create_mock_session(json_data=tickers_payload)
+    resolved = resolve_ticker("XOM", session=mock_session, cache_dir=tmp_path)
+
+    assert resolved["ticker"] == "XOM"
+    assert resolved["cik"] == "0002115436"
+    assert resolved["company_name"] == "ExxonMobil Holdings Corp"
+
+
+def test_historical_panel_registrants_isolation() -> None:
+    """Verify only XOM has a historical registrant override for the 2023-2025 panel."""
+    assert set(HISTORICAL_PANEL_REGISTRANTS.keys()) == {"XOM"}
+    assert HISTORICAL_PANEL_REGISTRANTS["XOM"]["cik"] == "0000034088"
+    assert HISTORICAL_PANEL_REGISTRANTS["XOM"]["company_name"] == "EXXON MOBIL CORP"
+
+    for ticker in PANEL_TICKERS.keys():
+        if ticker != "XOM":
+            assert ticker not in HISTORICAL_PANEL_REGISTRANTS
+
+
+def test_xom_historical_filings_selection(tmp_path: Path) -> None:
+    """Verify XOM's three historical 10-K filings are assigned to the correct fiscal years."""
+    raw_dir = tmp_path
+    sub_dir = raw_dir / "submissions"
+    sub_dir.mkdir(parents=True)
+    facts_dir = raw_dir / "companyfacts"
+    facts_dir.mkdir(parents=True)
+
+    xom_sub = {
+        "cik": "0000034088",
+        "entityType": "operating",
+        "name": "EXXON MOBIL CORP",
+        "filings": {
+            "recent": {
+                "accessionNumber": [
+                    "0000034088-26-000045",
+                    "0000034088-25-000010",
+                    "0000034088-24-000018",
+                ],
+                "form": ["10-K", "10-K", "10-K"],
+                "filingDate": ["2026-02-25", "2025-02-26", "2024-02-28"],
+                "reportDate": ["2025-12-31", "2024-12-31", "2023-12-31"],
+                "primaryDocument": ["xom-20251231.htm", "xom-20241231.htm", "xom-20231231.htm"],
+            }
+        },
+    }
+    (sub_dir / "CIK0000034088.json").write_text(json.dumps(xom_sub), encoding="utf-8")
+
+    xom_facts = {
+        "cik": 34088,
+        "entityName": "EXXON MOBIL CORP",
+        "facts": {
+            "us-gaap": {
+                "Revenues": {
+                    "units": {
+                        "USD": [
+                            {"form": "10-K", "fp": "FY", "fy": 2025, "accn": "0000034088-26-000045", "val": 300},
+                            {"form": "10-K", "fp": "FY", "fy": 2024, "accn": "0000034088-25-000010", "val": 200},
+                            {"form": "10-K", "fp": "FY", "fy": 2023, "accn": "0000034088-24-000018", "val": 100},
+                        ]
+                    }
+                }
+            }
+        },
+    }
+    (facts_dir / "CIK0000034088.json").write_text(json.dumps(xom_facts), encoding="utf-8")
+
+    records = select_annual_filings_for_company(
+        cik="0000034088",
+        ticker="XOM",
+        company_name="EXXON MOBIL CORP",
+        sector="Energy and utilities",
+        target_years=[2023, 2024, 2025],
+        as_of=COLLECTION_CUTOFF_DATE,
+        cache_dir=raw_dir,
+    )
+
+    rec_by_year = {r["target_fiscal_year"]: r for r in records}
+    assert rec_by_year[2023]["accession_number"] == "0000034088-24-000018"
+    assert rec_by_year[2023]["fiscal_year_status"] == "confirmed"
+    assert rec_by_year[2023]["cik"] == "0000034088"
+    assert rec_by_year[2023]["form"] == "10-K"
+
+    assert rec_by_year[2024]["accession_number"] == "0000034088-25-000010"
+    assert rec_by_year[2024]["fiscal_year_status"] == "confirmed"
+    assert rec_by_year[2024]["cik"] == "0000034088"
+    assert rec_by_year[2024]["form"] == "10-K"
+
+    assert rec_by_year[2025]["accession_number"] == "0000034088-26-000045"
+    assert rec_by_year[2025]["fiscal_year_status"] == "confirmed"
+    assert rec_by_year[2025]["cik"] == "0000034088"
+    assert rec_by_year[2025]["form"] == "10-K"
 
 
 def test_cli_verification(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
