@@ -1,43 +1,66 @@
-# Environment variables
+# Environment & secrets
 .env
+.env.*
+!.env.example
+*.pem
+*.key
 
-# Virtual environment
+# Virtual environments
 .venv/
-env/
 venv/
+ENV/
+env/
 
-# Python caches
+# Python caches & build artifacts
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
-# pytest cache
+# Testing & code quality
 .pytest_cache/
 .coverage
 htmlcov/
+.mypy_cache/
+.ruff_cache/
 
-# Local downloaded SEC files and runtime data
-data/raw/
+# Local SEC filings, caches, and downloaded data
 data/
+*.db
+*.sqlite
+*.sqlite3
 
-# Notebook checkpoints
-.ipynb_checkpoints/
-
-# Model weights
+# Model weights & embeddings
+models/
 *.pt
-*.pth
 *.bin
 *.onnx
 *.safetensors
 
-# Temporary output files and logs
+# Logs and temporary files
 *.log
-*.tmp
-temp/
+logs/
 tmp/
+temp/
 
-# OS-generated temporary files
+# IDE & OS
+.vscode/
+.idea/
 .DS_Store
 Thumbs.db
-desktop.ini
