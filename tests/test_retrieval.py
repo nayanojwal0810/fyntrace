@@ -154,6 +154,14 @@ def test_4_invalid_metadata_and_offset_rejection(tmp_path: Path) -> None:
         load_chunks(p)
     assert "invalid 'section_confidence'" in str(exc.value)
 
+    # Conflicting file_sha256 for a single accession
+    c_hash1 = make_valid_chunk("C_H1", accession="0000950170-24-087843", file_sha256="1" * 64)
+    c_hash2 = make_valid_chunk("C_H2", accession="0000950170-24-087843", file_sha256="2" * 64)
+    write_chunks_jsonl(p, [c_hash1, c_hash2])
+    with pytest.raises(ValueError) as exc:
+        load_chunks(p)
+    assert "Conflicting file_sha256 for accession" in str(exc.value)
+
 
 def test_5_deterministic_tokenization() -> None:
     """5. Deterministic tokenization."""

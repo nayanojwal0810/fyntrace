@@ -334,9 +334,6 @@ def test_14_correct_company_year_accession_metadata() -> None:
 
 def test_15_successful_jsonl_generation(tmp_path: Path) -> None:
     """15. Successful JSONL generation via build_filing_corpus."""
-    manifest_file = tmp_path / "filing_manifest.json"
-    manifest_file.write_text(json.dumps([SAMPLE_FILING_RECORD_MSFT]), encoding="utf-8")
-
     raw_dir = tmp_path / "raw" / "filings"
     processed_dir = tmp_path / "processed" / "filing_text"
     chunks_file = tmp_path / "processed" / "chunks.jsonl"
@@ -347,7 +344,7 @@ def test_15_successful_jsonl_generation(tmp_path: Path) -> None:
     summary = build_filing_corpus(
         tickers=["MSFT"],
         years=[2024],
-        manifest_path=manifest_file,
+        manifest=[SAMPLE_FILING_RECORD_MSFT],
         raw_dir=raw_dir,
         processed_dir=processed_dir,
         chunks_path=chunks_file,
@@ -536,8 +533,7 @@ def test_valid_character_offsets_and_no_lost_content() -> None:
 
 def test_incremental_corpus_merging_and_no_duplicates(tmp_path: Path) -> None:
     """Confirm incremental merging preserves unrelated filings and avoids duplicates."""
-    manifest_file = tmp_path / "filing_manifest.json"
-    manifest_file.write_text(json.dumps([SAMPLE_FILING_RECORD_MSFT, SAMPLE_FILING_RECORD_XOM]), encoding="utf-8")
+    manifest_records = [SAMPLE_FILING_RECORD_MSFT, SAMPLE_FILING_RECORD_XOM]
 
     raw_dir = tmp_path / "raw"
     processed_dir = tmp_path / "processed" / "text"
@@ -550,7 +546,7 @@ def test_incremental_corpus_merging_and_no_duplicates(tmp_path: Path) -> None:
     summary1 = build_filing_corpus(
         tickers=["MSFT"],
         years=[2024],
-        manifest_path=manifest_file,
+        manifest=manifest_records,
         raw_dir=raw_dir,
         processed_dir=processed_dir,
         chunks_path=chunks_path,
@@ -564,7 +560,7 @@ def test_incremental_corpus_merging_and_no_duplicates(tmp_path: Path) -> None:
     summary2 = build_filing_corpus(
         tickers=["XOM"],
         years=[2024],
-        manifest_path=manifest_file,
+        manifest=manifest_records,
         raw_dir=raw_dir,
         processed_dir=processed_dir,
         chunks_path=chunks_path,
@@ -580,7 +576,7 @@ def test_incremental_corpus_merging_and_no_duplicates(tmp_path: Path) -> None:
     summary3 = build_filing_corpus(
         tickers=["MSFT"],
         years=[2024],
-        manifest_path=manifest_file,
+        manifest=manifest_records,
         raw_dir=raw_dir,
         processed_dir=processed_dir,
         chunks_path=chunks_path,
@@ -596,8 +592,7 @@ def test_incremental_corpus_merging_and_no_duplicates(tmp_path: Path) -> None:
 
 def test_existing_corpus_preserved_on_failure(tmp_path: Path) -> None:
     """Confirm existing corpus file remains untouched if a filing download fails."""
-    manifest_file = tmp_path / "filing_manifest.json"
-    manifest_file.write_text(json.dumps([SAMPLE_FILING_RECORD_MSFT, SAMPLE_FILING_RECORD_XOM]), encoding="utf-8")
+    manifest_records = [SAMPLE_FILING_RECORD_MSFT, SAMPLE_FILING_RECORD_XOM]
 
     raw_dir = tmp_path / "raw"
     processed_dir = tmp_path / "processed" / "text"
@@ -609,7 +604,7 @@ def test_existing_corpus_preserved_on_failure(tmp_path: Path) -> None:
     build_filing_corpus(
         tickers=["MSFT"],
         years=[2024],
-        manifest_path=manifest_file,
+        manifest=manifest_records,
         raw_dir=raw_dir,
         processed_dir=processed_dir,
         chunks_path=chunks_path,
@@ -623,7 +618,7 @@ def test_existing_corpus_preserved_on_failure(tmp_path: Path) -> None:
     summary_err = build_filing_corpus(
         tickers=["XOM"],
         years=[2024],
-        manifest_path=manifest_file,
+        manifest=manifest_records,
         raw_dir=raw_dir,
         processed_dir=processed_dir,
         chunks_path=chunks_path,
@@ -635,9 +630,6 @@ def test_existing_corpus_preserved_on_failure(tmp_path: Path) -> None:
 
 def test_corrupt_corpus_file_rejected(tmp_path: Path) -> None:
     """Confirm corrupted existing chunks.jsonl is rejected rather than silently overwritten."""
-    manifest_file = tmp_path / "filing_manifest.json"
-    manifest_file.write_text(json.dumps([SAMPLE_FILING_RECORD_MSFT]), encoding="utf-8")
-
     chunks_path = tmp_path / "chunks.jsonl"
     chunks_path.write_text("{this is not valid json\n", encoding="utf-8")
 
@@ -648,7 +640,7 @@ def test_corrupt_corpus_file_rejected(tmp_path: Path) -> None:
         build_filing_corpus(
             tickers=["MSFT"],
             years=[2024],
-            manifest_path=manifest_file,
+            manifest=[SAMPLE_FILING_RECORD_MSFT],
             chunks_path=chunks_path,
             session=session,
         )
@@ -666,16 +658,13 @@ def test_cli_nonzero_exit_on_failure() -> None:
 
 def test_deduplicate_repeated_ticker_and_years(tmp_path: Path) -> None:
     """Confirm repeated ticker and year arguments are deduplicated."""
-    manifest_file = tmp_path / "filing_manifest.json"
-    manifest_file.write_text(json.dumps([SAMPLE_FILING_RECORD_MSFT]), encoding="utf-8")
-
     session = MagicMock(spec=requests.Session)
     session.get.return_value = create_mock_response(200, SAMPLE_HTML.encode("utf-8"))
 
     summary = build_filing_corpus(
         tickers=["MSFT", "msft", "MSFT"],
         years=[2024, 2024],
-        manifest_path=manifest_file,
+        manifest=[SAMPLE_FILING_RECORD_MSFT],
         chunks_path=tmp_path / "chunks.jsonl",
         raw_dir=tmp_path / "raw",
         processed_dir=tmp_path / "processed",
@@ -723,4 +712,218 @@ def test_long_table_row_preservation() -> None:
     assert len(chunks) >= 1
     assert table_line in chunks[0]["text"]
     assert text[chunks[0]["char_start"]:chunks[0]["char_end"]] == chunks[0]["text"]
+
+
+def test_table_grid_rowspan_colspan_and_nested_tables() -> None:
+    """Step 4 regression tests: HTML table grid rowspan, colspan, empty cells, nested tables, invalid spans."""
+    # 1. Basic 3-column table with empty middle cell
+    html_basic = (
+        "<table>"
+        "<tr><td>Col1</td><td></td><td>Col3</td></tr>"
+        "<tr><td>Val1</td><td>Val2</td><td>Val3</td></tr>"
+        "</table>"
+    )
+    soup1 = BeautifulSoup(html_basic, "lxml")
+    t1 = extract_table_text(soup1.table)
+    assert t1 == "Col1 |  | Col3\nVal1 | Val2 | Val3"
+
+    # 2. colspan=2
+    html_colspan = (
+        "<table>"
+        "<tr><td colspan='2'>Header Span</td><td>Header 3</td></tr>"
+        "<tr><td>Val1</td><td>Val2</td><td>Val3</td></tr>"
+        "</table>"
+    )
+    soup2 = BeautifulSoup(html_colspan, "lxml")
+    t2 = extract_table_text(soup2.table)
+    assert t2 == "Header Span |  | Header 3\nVal1 | Val2 | Val3"
+
+    # 3. rowspan=2
+    html_rowspan = (
+        "<table>"
+        "<tr><td rowspan='2'>Multi-row Category</td><td>FY23</td><td>$ 1,000</td></tr>"
+        "<tr><td>FY24</td><td>$ 1,200</td></tr>"
+        "</table>"
+    )
+    soup3 = BeautifulSoup(html_rowspan, "lxml")
+    t3 = extract_table_text(soup3.table)
+    assert t3 == "Multi-row Category | FY23 | $ 1,000\n | FY24 | $ 1,200"
+
+    # 4. Combined rowspan and colspan
+    html_combined = (
+        "<table>"
+        "<tr><td rowspan='2' colspan='2'>Big Cell</td><td>Col 3</td></tr>"
+        "<tr><td>Col 3 Row 2</td></tr>"
+        "<tr><td>Row 3 Col 1</td><td>Row 3 Col 2</td><td>Row 3 Col 3</td></tr>"
+        "</table>"
+    )
+    soup4 = BeautifulSoup(html_combined, "lxml")
+    t4 = extract_table_text(soup4.table)
+    assert t4 == "Big Cell |  | Col 3\n |  | Col 3 Row 2\nRow 3 Col 1 | Row 3 Col 2 | Row 3 Col 3"
+
+    # 5. Subsequent row numeric values retaining correct column position
+    html_subsequent = (
+        "<table>"
+        "<tr><th>Metric</th><th colspan='2'>2024</th><th colspan='2'>2023</th></tr>"
+        "<tr><td rowspan='2'>Revenue</td><td>Commercial</td><td>$ 50,000</td><td>Commercial</td><td>$ 40,000</td></tr>"
+        "<tr><td>Consumer</td><td>$ 30,000</td><td>Consumer</td><td>$ 25,000</td></tr>"
+        "</table>"
+    )
+    soup5 = BeautifulSoup(html_subsequent, "lxml")
+    t5 = extract_table_text(soup5.table)
+    lines5 = t5.split("\n")
+    assert lines5[0] == "Metric | 2024 |  | 2023 | "
+    assert lines5[1] == "Revenue | Commercial | $ 50,000 | Commercial | $ 40,000"
+    assert lines5[2] == " | Consumer | $ 30,000 | Consumer | $ 25,000"
+
+    # 6. Nested tables not duplicating rows or cells
+    html_nested = (
+        "<table>"
+        "<tr><td>Outer Row 1</td><td>"
+        "<table><tr><td>Inner Cell</td></tr></table>"
+        "</td></tr>"
+        "<tr><td>Outer Row 2</td><td>Outer Data</td></tr>"
+        "</table>"
+    )
+    soup6 = BeautifulSoup(html_nested, "lxml")
+    outer_table = soup6.find("table")
+    t6 = extract_table_text(outer_table)
+    assert "Outer Row 1 | Inner Cell\nOuter Row 2 | Outer Data" == t6
+
+    # 7. Invalid span values handled safely (not crashing, bounded)
+    html_invalid = (
+        "<table>"
+        "<tr><td colspan='invalid'>Cell 1</td><td rowspan='-5'>Cell 2</td><td colspan='99999'>Cell 3</td></tr>"
+        "<tr><td>Next 1</td><td>Next 2</td><td>Next 3</td></tr>"
+        "</table>"
+    )
+    soup7 = BeautifulSoup(html_invalid, "lxml")
+    t7 = extract_table_text(soup7.table)
+    assert "Cell 1" in t7
+    assert "Next 1" in t7
+
+    # 8. Negative figures, percentages and commas
+    html_fin = (
+        "<table>"
+        "<tr><td>Net Income</td><td>(2,450)</td><td>-15.4%</td></tr>"
+        "</table>"
+    )
+    soup8 = BeautifulSoup(html_fin, "lxml")
+    t8 = extract_table_text(soup8.table)
+    assert t8 == "Net Income | (2,450) | -15.4%"
+
+    # 9. Exact canonical character offsets after extraction
+    full_html = f"<html><body><p>Introductory text before table.</p>{html_fin}<p>Concluding text after table.</p></body></html>"
+    visible = extract_visible_text(full_html)
+    tbl_idx = visible.find("Net Income | (2,450) | -15.4%")
+    assert tbl_idx != -1
+    extracted_tbl = visible[tbl_idx:tbl_idx + len("Net Income | (2,450) | -15.4%")]
+    assert extracted_tbl == "Net Income | (2,450) | -15.4%"
+
+
+def test_manifest_path_strictly_validated_no_bypass(tmp_path: Path) -> None:
+    """Step 5 regression test: A malformed manifest path must fail with ValueError rather than bypassing validation."""
+    bad_manifest = tmp_path / "bad_manifest.json"
+    bad_manifest.write_text(json.dumps([{"ticker": "MSFT"}]), encoding="utf-8")
+
+    with pytest.raises(ValueError) as exc:
+        build_filing_corpus(
+            tickers=["MSFT"],
+            years=[2024],
+            manifest_path=bad_manifest,
+            chunks_path=tmp_path / "chunks.jsonl",
+            raw_dir=tmp_path / "raw",
+            processed_dir=tmp_path / "processed",
+        )
+    assert "Filing manifest must contain exactly 90 records" in str(exc.value)
+
+
+def test_download_filing_rejects_untrusted_url_or_invalid_accession(tmp_path: Path) -> None:
+    """Step 5 regression test: download_filing rejects malformed accession, invalid CIK, bad primary doc, untrusted URL."""
+    # Malformed accession
+    rec_bad_accn = dict(SAMPLE_FILING_RECORD_MSFT)
+    rec_bad_accn["accession_number"] = "invalid_accn"
+    with pytest.raises(ValueError, match="Invalid accession number format"):
+        download_filing(rec_bad_accn, cache_dir=tmp_path)
+
+    # Path traversal in primary document
+    rec_traversal = dict(SAMPLE_FILING_RECORD_MSFT)
+    rec_traversal["primary_document"] = "../evil.htm"
+    with pytest.raises(ValueError, match="Invalid primary document name"):
+        download_filing(rec_traversal, cache_dir=tmp_path)
+
+    # Untrusted URL host
+    rec_bad_host = dict(SAMPLE_FILING_RECORD_MSFT)
+    rec_bad_host["source_url"] = "https://evil.com/Archives/edgar/data/789019/000095017024087843/msft-20240630.htm"
+    with pytest.raises(ValueError, match="Source URL mismatch"):
+        download_filing(rec_bad_host, cache_dir=tmp_path)
+
+
+def test_corpus_validation_rejects_corrupt_records(tmp_path: Path) -> None:
+    """Step 6 regression tests: corpus validation rejects invalid offsets, bad SHA-256, bad SEC host, duplicate IDs, conflicting hashes."""
+    from src.filings import load_and_validate_corpus
+
+    base_chunk = {
+        "chunk_id": "MSFT_2024_10K_000095017024087843_0001",
+        "ticker": "MSFT",
+        "company_name": "Microsoft Corporation",
+        "cik": "0000789019",
+        "fiscal_year": 2024,
+        "form": "10-K",
+        "accession": "0000950170-24-087843",
+        "report_date": "2024-06-30",
+        "section": "Item 1 - Business",
+        "section_confidence": "high",
+        "text": "Valid filing text chunk.",
+        "char_start": 0,
+        "char_end": 24,
+        "source_url": "https://www.sec.gov/Archives/edgar/data/789019/000095017024087843/msft-20240630.htm",
+        "file_sha256": "a" * 64,
+    }
+
+    chunks_file = tmp_path / "test_chunks.jsonl"
+
+    # 1. Duplicate chunk ID
+    c1 = dict(base_chunk)
+    c2 = dict(base_chunk)
+    chunks_file.write_text(json.dumps(c1) + "\n" + json.dumps(c2) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Duplicate chunk ID"):
+        load_and_validate_corpus(chunks_file)
+
+    # 2. Incorrect offsets (char_end - char_start != len(text))
+    c_bad_offset = dict(base_chunk)
+    c_bad_offset["char_end"] = 30
+    chunks_file.write_text(json.dumps(c_bad_offset) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="character offset span"):
+        load_and_validate_corpus(chunks_file)
+
+    # 3. Invalid SHA-256
+    c_bad_sha = dict(base_chunk)
+    c_bad_sha["file_sha256"] = "short_hash"
+    chunks_file.write_text(json.dumps(c_bad_sha) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid 'file_sha256'"):
+        load_and_validate_corpus(chunks_file)
+
+    # 4. Wrong SEC hostname
+    c_bad_host = dict(base_chunk)
+    c_bad_host["source_url"] = "https://untrusted.org/filing.htm"
+    chunks_file.write_text(json.dumps(c_bad_host) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="must be an official SEC URL"):
+        load_and_validate_corpus(chunks_file)
+
+    # 5. Missing required metadata (missing ticker)
+    c_missing = dict(base_chunk)
+    del c_missing["ticker"]
+    chunks_file.write_text(json.dumps(c_missing) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="missing or invalid 'ticker'"):
+        load_and_validate_corpus(chunks_file)
+
+    # 6. Conflicting hashes for a single accession
+    c_part1 = dict(base_chunk)
+    c_part2 = dict(base_chunk)
+    c_part2["chunk_id"] = "MSFT_2024_10K_000095017024087843_0002"
+    c_part2["file_sha256"] = "b" * 64
+    chunks_file.write_text(json.dumps(c_part1) + "\n" + json.dumps(c_part2) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Conflicting file_sha256 for accession"):
+        load_and_validate_corpus(chunks_file)
 

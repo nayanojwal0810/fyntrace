@@ -485,3 +485,160 @@ def test_23_json_serialization_of_all_public_results() -> None:
         serialized = json.dumps(item)
         assert isinstance(serialized, str)
 
+
+def test_24_jpm_revenues_vs_msft_revenues_not_comparable() -> None:
+    """JPM tagged Revenues vs MSFT tagged Revenues must be not_comparable based on sector identity."""
+    facts = {
+        ("JPM", 2024, "revenue"): make_fact_row(
+            ticker="JPM",
+            company_name="JPMORGAN CHASE & CO",
+            tag="Revenues",
+            value=177556000000,
+        ),
+        ("MSFT", 2024, "revenue"): make_fact_row(
+            ticker="MSFT",
+            company_name="MICROSOFT CORP",
+            tag="Revenues",
+            value=245122000000,
+        ),
+    }
+    res = compare_companies("JPM", "MSFT", 2024, "revenue", facts)
+    assert res["status"] == "not_comparable"
+    assert "materially incompatible" in res["reason"]
+    assert "financial services" in res["reason"]
+    assert res["company_a"]["ticker"] == "JPM"
+    assert res["company_b"]["ticker"] == "MSFT"
+    assert res["company_a"]["tag"] == "Revenues"
+    assert res["company_b"]["tag"] == "Revenues"
+    assert len(res["sources"]) == 2
+
+
+def test_25_gs_vs_wmt_revenue_not_comparable() -> None:
+    """GS tagged RevenuesNetOfInterestExpense vs WMT tagged Revenues must be not_comparable."""
+    facts = {
+        ("GS", 2024, "revenue"): make_fact_row(
+            ticker="GS",
+            company_name="GOLDMAN SACHS GROUP INC",
+            tag="RevenuesNetOfInterestExpense",
+            value=53500000000,
+        ),
+        ("WMT", 2024, "revenue"): make_fact_row(
+            ticker="WMT",
+            company_name="WALMART INC",
+            tag="Revenues",
+            value=648125000000,
+        ),
+    }
+    res = compare_companies("GS", "WMT", 2024, "revenue", facts)
+    assert res["status"] == "not_comparable"
+    assert "materially incompatible" in res["reason"]
+
+
+def test_26_jpm_vs_msft_assets_comparison_succeeds() -> None:
+    """JPM vs MSFT assets comparison succeeds normally across sectors."""
+    facts = {
+        ("JPM", 2024, "assets"): make_fact_row(
+            ticker="JPM",
+            company_name="JPMORGAN CHASE & CO",
+            tag="Assets",
+            value=4169974000000,
+        ),
+        ("MSFT", 2024, "assets"): make_fact_row(
+            ticker="MSFT",
+            company_name="MICROSOFT CORP",
+            tag="Assets",
+            value=512163000000,
+        ),
+    }
+    res = compare_companies("JPM", "MSFT", 2024, "assets", facts)
+    assert res["status"] == "success"
+    assert res["difference"] == 4169974000000 - 512163000000
+    assert res["company_a"]["ticker"] == "JPM"
+    assert res["company_b"]["ticker"] == "MSFT"
+
+
+def test_27_two_banks_revenue_comparison_logic() -> None:
+    """Bank-vs-bank revenue comparison inspects accounting concepts and notes tag differences."""
+    facts = {
+        ("JPM", 2024, "revenue"): make_fact_row(
+            ticker="JPM",
+            company_name="JPMORGAN CHASE & CO",
+            tag="Revenues",
+            value=177556000000,
+        ),
+        ("GS", 2024, "revenue"): make_fact_row(
+            ticker="GS",
+            company_name="GOLDMAN SACHS GROUP INC",
+            tag="RevenuesNetOfInterestExpense",
+            value=53500000000,
+        ),
+    }
+    res = compare_companies("JPM", "GS", 2024, "revenue", facts)
+    assert res["status"] == "success"
+    assert res["difference"] == 177556000000 - 53500000000
+    assert any("financial institutions reporting bank net revenue" in n for n in res["notes"])
+
+
+def test_28_unsupported_revenue_tag_returns_not_comparable() -> None:
+    """Companies using unrecognized or non-revenue tags are not declared comparable."""
+    facts = {
+        ("MSFT", 2024, "revenue"): make_fact_row(ticker="MSFT", tag="RevenueFromContractWithCustomerExcludingAssessedTax", value=200000),
+        ("AAPL", 2024, "revenue"): make_fact_row(ticker="AAPL", tag="UnrecognizedCustomTag", value=250000),
+    }
+    res = compare_companies("MSFT", "AAPL", 2024, "revenue", facts)
+    assert res["status"] == "not_comparable"
+    assert "cannot be established as comparable" in res["reason"]
+
+
+def test_29_fractional_monetary_rejection_in_load_facts(tmp_path: Path) -> None:
+    """load_facts rejects fractional monetary values rather than silently truncating."""
+    row = make_fact_row(value=100.75)
+    f = tmp_path / "fractional.jsonl"
+    f.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError) as exc:
+        load_facts(f)
+    assert "fractional" in str(exc.value).lower()
+
+
+def test_30_fractional_monetary_abstention_in_calculations() -> None:
+    """Direct calculation calls abstain when given fractional monetary values without silent truncation."""
+    facts = {
+        ("MSFT", 2024, "assets"): make_fact_row(metric="assets", value=500.5),
+        ("MSFT", 2024, "liabilities"): make_fact_row(metric="liabilities", value=200),
+    }
+    res_na = calculate_net_assets("MSFT", 2024, facts)
+    assert res_na["status"] == "unavailable"
+    assert "fractional" in res_na["reason"].lower()
+
+    facts_comp = {
+        ("MSFT", 2024, "assets"): make_fact_row(ticker="MSFT", metric="assets", value=500.75),
+        ("AAPL", 2024, "assets"): make_fact_row(ticker="AAPL", metric="assets", value=300),
+    }
+    res_comp = compare_companies("MSFT", "AAPL", 2024, "assets", facts_comp)
+    assert res_comp["status"] == "unavailable"
+    assert "fractional" in res_comp["reason"].lower()
+
+
+def test_31_negative_net_assets_preserved() -> None:
+    """Negative net assets (where liabilities exceed assets) is preserved as an exact negative integer."""
+    facts = {
+        ("MSFT", 2024, "assets"): make_fact_row(metric="assets", value=100000000),
+        ("MSFT", 2024, "liabilities"): make_fact_row(metric="liabilities", value=150000000),
+    }
+    res = calculate_net_assets("MSFT", 2024, facts)
+    assert res["status"] == "success"
+    assert res["value"] == -50000000
+    assert isinstance(res["value"], int)
+
+
+def test_32_msft_fy2024_net_assets_exact_value() -> None:
+    """Verify MSFT FY2024 net assets remains exactly 268477000000 USD from actual facts."""
+    facts = load_facts()
+    res = calculate_net_assets("MSFT", 2024, facts)
+    assert res["status"] == "success"
+    assert res["value"] == 268477000000
+    assert res["inputs"]["assets"] == 512163000000
+    assert res["inputs"]["liabilities"] == 243686000000
+
+

@@ -76,6 +76,7 @@ def load_chunks(path: Path | str | None = None) -> list[dict[str, Any]]:
 
     chunks: list[dict[str, Any]] = []
     seen_chunk_ids: set[str] = set()
+    accession_hashes: dict[str, str] = {}
 
     with open(chunks_path, "r", encoding="utf-8") as f:
         for line_no, raw_line in enumerate(f, start=1):
@@ -150,6 +151,13 @@ def load_chunks(path: Path | str | None = None) -> list[dict[str, Any]]:
                 or not all(c in "0123456789abcdefABCDEF" for c in sha)
             ):
                 raise ValueError(f"Chunk '{chunk_id}' has invalid 'file_sha256': {sha!r}")
+
+            if accession in accession_hashes and accession_hashes[accession] != sha:
+                raise ValueError(
+                    f"Conflicting file_sha256 for accession '{accession}': "
+                    f"'{accession_hashes[accession]}' vs '{sha}'"
+                )
+            accession_hashes[accession] = sha
 
             confidence = chunk.get("section_confidence")
             if confidence not in ("high", "low", "unknown"):

@@ -11,10 +11,18 @@ import warnings
 from pathlib import Path
 from typing import Any
 
+from urllib.parse import urlparse
+
 from bs4 import BeautifulSoup, Comment, Tag, XMLParsedAsHTMLWarning
 import requests
 
-from src.sec_data import DEFAULT_TIMEOUT, load_filing_manifest, make_sec_session
+from src.sec_data import (
+    DEFAULT_TIMEOUT,
+    filing_url,
+    load_filing_manifest,
+    make_sec_session,
+    normalize_cik,
+)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_MANIFEST_PATH = BASE_DIR / "data" / "processed" / "filing_manifest.json"
@@ -164,14 +172,48 @@ def download_filing(
     """Download and cache SEC filing HTML document.
 
     Reuses valid cached HTML files without downloading again.
+    Validates filing metadata, accession format, and official SEC HTTPS URL.
     Returns:
         tuple[Path, str]: (path_to_cached_html_file, sha256_hexdigest)
     """
     raw_filings_dir = Path(cache_dir) if cache_dir is not None else DEFAULT_RAW_FILINGS_DIR
     raw_filings_dir.mkdir(parents=True, exist_ok=True)
 
-    accession = filing_record["accession_number"]
-    target_file = raw_filings_dir / f"{accession}.html"
+    accession = filing_record.get("accession_number")
+    if not isinstance(accession, str) or not re.match(r"^\d{10}-\d{2}-\d{6}$", accession.strip()):
+        raise ValueError(f"Invalid accession number format: {accession!r}. Must match 0000000000-00-000000.")
+    accn_clean = accession.strip()
+
+    cik = filing_record.get("cik")
+    if not cik:
+        raise ValueError(f"Filing record missing valid CIK for {accn_clean}.")
+    cik_norm = normalize_cik(cik)
+
+    primary_doc = filing_record.get("primary_document")
+    if (
+        not isinstance(primary_doc, str)
+        or not primary_doc.strip()
+        or "/" in primary_doc
+        or "\\" in primary_doc
+        or ".." in primary_doc
+        or not re.match(r"^[a-zA-Z0-9_\-\.]+$", primary_doc.strip())
+    ):
+        raise ValueError(f"Invalid primary document name: {primary_doc!r}")
+    doc_clean = primary_doc.strip()
+
+    source_url = filing_record.get("source_url")
+    if not source_url or not isinstance(source_url, str):
+        raise ValueError(f"Filing record missing source_url for {accn_clean}.")
+
+    expected_url = filing_url(cik_norm, accn_clean, doc_clean)
+    if source_url != expected_url:
+        raise ValueError(f"Source URL mismatch in filing record: expected '{expected_url}', got '{source_url}'")
+
+    parsed_url = urlparse(source_url)
+    if parsed_url.scheme.lower() != "https" or parsed_url.netloc.lower() not in ("www.sec.gov", "sec.gov"):
+        raise ValueError(f"Untrusted SEC filing source URL: {source_url!r}")
+
+    target_file = raw_filings_dir / f"{accn_clean}.html"
 
     # Reuse valid cache
     if target_file.is_file():
@@ -182,10 +224,6 @@ def download_filing(
                 return target_file, sha256_hash
         except Exception:
             pass
-
-    source_url = filing_record.get("source_url")
-    if not source_url:
-        raise ValueError(f"Filing record missing source_url for {accession}.")
 
     sec_session = session if session is not None else make_sec_session()
 
@@ -210,7 +248,7 @@ def download_filing(
         raise ValueError(f"Downloaded content from {source_url} is not valid SEC HTML document.")
 
     sha256_hash = hashlib.sha256(content_bytes).hexdigest()
-    tmp_file = raw_filings_dir / f"{accession}.html.tmp_{uuid.uuid4().hex}"
+    tmp_file = raw_filings_dir / f"{accn_clean}.html.tmp_{uuid.uuid4().hex}"
     try:
         tmp_file.write_bytes(content_bytes)
         tmp_file.replace(target_file)
@@ -225,29 +263,74 @@ def download_filing(
 def extract_table_text(table_tag: Tag) -> str:
     """Format an HTML table tag into a readable string preserving rows, cells, and alignment.
 
+    Implements a deterministic HTML table-grid routine handling both colspan and rowspan.
     Preserves numbers, negative signs, decimals, commas, percentages, currency symbols.
-    Preserves empty cell positions so column alignment is maintained across rows.
+    Preserves empty cell positions so column alignment is maintained across multirow cells.
+    Prevents nested tables from duplicating rows or cells.
     Cells in a row are separated by ' | '.
     """
-    rows = []
+    # 1. Find only direct rows belonging to this table, ignoring any nested tables
+    direct_rows = []
     for tr in table_tag.find_all("tr"):
-        cells = []
+        if tr.find_parent("table") is table_tag:
+            direct_rows.append(tr)
+
+    grid: dict[tuple[int, int], str] = {}
+
+    for r, tr in enumerate(direct_rows):
+        c = 0
+        direct_cells = []
         for cell in tr.find_all(["th", "td"]):
-            colspan_val = 1
-            if hasattr(cell, "attrs") and isinstance(cell.attrs, dict):
-                try:
-                    colspan_val = int(cell.attrs.get("colspan", 1))
-                except (ValueError, TypeError):
-                    colspan_val = 1
+            if cell.find_parent("tr") is tr:
+                direct_cells.append(cell)
+
+        for cell in direct_cells:
+            # Advance to next unoccupied column in row r
+            while (r, c) in grid:
+                c += 1
+
+            try:
+                colspan = int(cell.attrs.get("colspan", 1))
+                if colspan < 1 or colspan > 100:
+                    colspan = 1
+            except (ValueError, TypeError):
+                colspan = 1
+
+            try:
+                rowspan = int(cell.attrs.get("rowspan", 1))
+                if rowspan < 1 or rowspan > 1000:
+                    rowspan = 1
+            except (ValueError, TypeError):
+                rowspan = 1
 
             text = " ".join(cell.get_text(" ", strip=True).split())
-            cells.append(text)
-            for _ in range(colspan_val - 1):
-                cells.append("")
+            grid[(r, c)] = text
 
-        if any(c for c in cells):
-            rows.append(" | ".join(cells))
-    return "\n".join(rows)
+            # Mark spanned cells with empty placeholder
+            for dr in range(rowspan):
+                for dc in range(colspan):
+                    if dr == 0 and dc == 0:
+                        continue
+                    grid[(r + dr, c + dc)] = ""
+
+            c += colspan
+
+    if not grid:
+        return ""
+
+    num_rows = max(len(direct_rows), max((r for r, c in grid.keys()), default=-1) + 1)
+    formatted_rows = []
+
+    for r in range(num_rows):
+        cols_in_r = [c for (row, c) in grid.keys() if row == r]
+        if not cols_in_r:
+            continue
+        max_c = max(cols_in_r) + 1
+        row_cells = [grid.get((r, col), "") for col in range(max_c)]
+        if any(c.strip() for c in row_cells):
+            formatted_rows.append(" | ".join(row_cells))
+
+    return "\n".join(formatted_rows)
 
 
 def extract_visible_text(html_content: str | bytes) -> str:
@@ -607,6 +690,172 @@ def make_chunks(
     return chunks
 
 
+def validate_chunk_record(chunk: Any, context: str = "") -> dict[str, Any]:
+    """Strictly validate an SEC filing evidence chunk record.
+
+    Validates schema types, required fields, accession format, CIK,
+    HTTPS SEC source URL, character offsets, SHA-256 hash, and section confidence.
+    """
+    if not isinstance(chunk, dict):
+        raise ValueError(f"Invalid chunk record{context}: expected JSON object.")
+
+    chunk_id = chunk.get("chunk_id")
+    if not isinstance(chunk_id, str) or not chunk_id.strip():
+        raise ValueError(f"Missing or invalid 'chunk_id'{context}.")
+
+    text = chunk.get("text")
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError(f"Chunk '{chunk_id}'{context} has empty or invalid 'text'.")
+
+    ticker = chunk.get("ticker")
+    if not isinstance(ticker, str) or not ticker.strip():
+        raise ValueError(f"Chunk '{chunk_id}'{context} has missing or invalid 'ticker'.")
+
+    company_name = chunk.get("company_name")
+    if not isinstance(company_name, str) or not company_name.strip():
+        raise ValueError(f"Chunk '{chunk_id}'{context} has missing or invalid 'company_name'.")
+
+    cik = chunk.get("cik")
+    if not isinstance(cik, str) or not cik.strip() or not re.match(r"^\d{1,10}$", cik.strip()):
+        raise ValueError(f"Chunk '{chunk_id}'{context} has missing or invalid 'cik': {cik!r}")
+
+    fy = chunk.get("fiscal_year")
+    if not isinstance(fy, int) or isinstance(fy, bool):
+        raise ValueError(f"Chunk '{chunk_id}'{context} has missing or invalid 'fiscal_year'.")
+
+    form = chunk.get("form")
+    if not isinstance(form, str) or not form.strip():
+        raise ValueError(f"Chunk '{chunk_id}'{context} has missing or invalid 'form'.")
+
+    accession = chunk.get("accession")
+    if not isinstance(accession, str) or not re.match(r"^\d{10}-\d{2}-\d{6}$", accession.strip()):
+        raise ValueError(f"Chunk '{chunk_id}'{context} has missing or invalid 'accession': {accession!r}")
+
+    report_date = chunk.get("report_date")
+    if not isinstance(report_date, str) or not re.match(r"^\d{4}-\d{2}-\d{2}$", report_date.strip()):
+        raise ValueError(f"Chunk '{chunk_id}'{context} has missing or invalid 'report_date': {report_date!r}")
+
+    section = chunk.get("section")
+    if not isinstance(section, str) or not section.strip():
+        raise ValueError(f"Chunk '{chunk_id}'{context} has missing or invalid 'section'.")
+
+    confidence = chunk.get("section_confidence")
+    if confidence not in ("high", "low", "unknown"):
+        raise ValueError(f"Chunk '{chunk_id}'{context} has invalid 'section_confidence': {confidence!r}")
+
+    source_url = chunk.get("source_url")
+    if not isinstance(source_url, str) or not source_url.strip():
+        raise ValueError(f"Chunk '{chunk_id}'{context} has missing 'source_url'.")
+
+    parsed_url = urlparse(source_url)
+    if parsed_url.scheme.lower() != "https" or parsed_url.netloc.lower() not in ("www.sec.gov", "sec.gov"):
+        raise ValueError(
+            f"Chunk '{chunk_id}'{context} source_url must be an official SEC URL on www.sec.gov or sec.gov with HTTPS scheme, got {source_url!r}"
+        )
+
+    char_start = chunk.get("char_start")
+    char_end = chunk.get("char_end")
+    if not isinstance(char_start, int) or isinstance(char_start, bool) or char_start < 0:
+        raise ValueError(f"Chunk '{chunk_id}'{context} has negative or invalid 'char_start': {char_start!r}")
+
+    if not isinstance(char_end, int) or isinstance(char_end, bool) or char_end < char_start:
+        raise ValueError(f"Chunk '{chunk_id}'{context} has reversed or invalid 'char_end': {char_end!r} < {char_start!r}")
+
+    if (char_end - char_start) != len(text):
+        raise ValueError(
+            f"Chunk '{chunk_id}'{context} character offset span ({char_end - char_start}) "
+            f"does not equal text length ({len(text)})."
+        )
+
+    sha = chunk.get("file_sha256")
+    if (
+        not isinstance(sha, str)
+        or len(sha) != 64
+        or not all(c in "0123456789abcdefABCDEF" for c in sha)
+    ):
+        raise ValueError(f"Chunk '{chunk_id}'{context} has invalid 'file_sha256': {sha!r}")
+
+    return chunk
+
+
+def load_and_validate_corpus(
+    chunks_path: Path,
+    processed_text_dir: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Load and strictly validate existing chunks.jsonl file.
+
+    Rejects malformed JSON, duplicate chunk IDs, schema violations,
+    conflicting accession metadata/hashes, and offset mismatches against
+    existing canonical text.
+    """
+    if not chunks_path.is_file():
+        return []
+
+    chunks: list[dict[str, Any]] = []
+    seen_chunk_ids: set[str] = set()
+    accession_meta: dict[str, dict[str, Any]] = {}
+    canonical_text_cache: dict[str, str] = {}
+
+    with open(chunks_path, "r", encoding="utf-8") as f:
+        for line_no, raw_line in enumerate(f, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            try:
+                record = json.loads(line)
+            except Exception as exc:
+                raise ValueError(f"Corrupt JSON on line {line_no} in existing corpus {chunks_path}: {exc}") from exc
+
+            validate_chunk_record(record, context=f" on line {line_no} in existing corpus {chunks_path}")
+
+            cid = record["chunk_id"]
+            if cid in seen_chunk_ids:
+                raise ValueError(f"Duplicate chunk ID '{cid}' on line {line_no} in existing corpus {chunks_path}.")
+            seen_chunk_ids.add(cid)
+
+            accn = record["accession"]
+            meta_sig = {
+                "ticker": record["ticker"],
+                "company_name": record["company_name"],
+                "cik": record["cik"],
+                "fiscal_year": record["fiscal_year"],
+                "file_sha256": record["file_sha256"],
+                "source_url": record["source_url"],
+            }
+            if accn in accession_meta:
+                prev_sig = accession_meta[accn]
+                if prev_sig["file_sha256"] != meta_sig["file_sha256"]:
+                    raise ValueError(
+                        f"Conflicting file_sha256 for accession '{accn}' on line {line_no}: "
+                        f"'{prev_sig['file_sha256']}' vs '{meta_sig['file_sha256']}'."
+                    )
+                if prev_sig["ticker"] != meta_sig["ticker"] or prev_sig["fiscal_year"] != meta_sig["fiscal_year"]:
+                    raise ValueError(
+                        f"Inconsistent metadata for accession '{accn}' on line {line_no}: "
+                        f"{prev_sig} vs {meta_sig}."
+                    )
+            else:
+                accession_meta[accn] = meta_sig
+
+            if processed_text_dir is not None:
+                txt_file = processed_text_dir / f"{accn}.txt"
+                if txt_file.is_file():
+                    if accn not in canonical_text_cache:
+                        canonical_text_cache[accn] = txt_file.read_text(encoding="utf-8")
+                    c_text = canonical_text_cache[accn]
+                    c_start = record["char_start"]
+                    c_end = record["char_end"]
+                    if c_end > len(c_text) or c_text[c_start:c_end] != record["text"]:
+                        raise ValueError(
+                            f"Chunk '{cid}' character offsets [{c_start}:{c_end}] do not match local canonical text for accession '{accn}'."
+                        )
+
+            chunks.append(record)
+
+    return chunks
+
+
 def build_filing_corpus(
     tickers: list[str] | None = None,
     years: list[int] | None = None,
@@ -627,11 +876,7 @@ def build_filing_corpus(
     if manifest is not None:
         manifest_records = manifest
     elif manifest_path is not None:
-        try:
-            manifest_records = load_filing_manifest(manifest_path)
-        except ValueError:
-            with open(manifest_path, "r", encoding="utf-8") as f:
-                manifest_records = json.load(f)
+        manifest_records = load_filing_manifest(manifest_path)
     else:
         manifest_records = load_filing_manifest(DEFAULT_MANIFEST_PATH)
 
@@ -646,24 +891,8 @@ def build_filing_corpus(
     processed_text_dir.mkdir(parents=True, exist_ok=True)
     out_chunks_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # 1. Load and validate existing corpus if present
-    existing_chunks: list[dict[str, Any]] = []
-    if out_chunks_path.is_file():
-        try:
-            with open(out_chunks_path, "r", encoding="utf-8") as f:
-                for line_no, line in enumerate(f, start=1):
-                    clean_line = line.strip()
-                    if not clean_line:
-                        continue
-                    try:
-                        record = json.loads(clean_line)
-                    except Exception as exc:
-                        raise ValueError(f"Corrupt JSON on line {line_no} in existing corpus {out_chunks_path}: {exc}") from exc
-                    if not isinstance(record, dict) or "chunk_id" not in record or "accession" not in record:
-                        raise ValueError(f"Invalid chunk record on line {line_no} in existing corpus {out_chunks_path}")
-                    existing_chunks.append(record)
-        except Exception as exc:
-            raise ValueError(f"Failed to read existing corpus at {out_chunks_path}: {exc}") from exc
+    # 1. Load and strictly validate existing corpus if present
+    existing_chunks = load_and_validate_corpus(out_chunks_path, processed_text_dir=processed_text_dir)
 
     successes: list[str] = []
     failures: list[dict[str, Any]] = []
@@ -720,6 +949,8 @@ def build_filing_corpus(
 
             sections = extract_sections(canonical_text)
             chunks = make_chunks(canonical_text, rec, file_hash, sections=sections)
+            for ch in chunks:
+                validate_chunk_record(ch, context=f" in generated chunk for {ident}")
             new_chunks.extend(chunks)
             successes.append(ident)
         except Exception as exc:
@@ -744,6 +975,15 @@ def build_filing_corpus(
     else:
         processed_accessions = {rec["accession_number"] for rec in target_records}
         retained_chunks = [c for c in existing_chunks if c.get("accession") not in processed_accessions]
+
+        # Verify no chunk ID collision between retained and new chunks
+        retained_ids = {c["chunk_id"] for c in retained_chunks}
+        for new_c in new_chunks:
+            if new_c["chunk_id"] in retained_ids:
+                raise ValueError(
+                    f"Chunk ID collision: newly generated chunk '{new_c['chunk_id']}' already exists in preserved chunks."
+                )
+
         final_chunks = retained_chunks + new_chunks
 
     # Atomically write chunks.jsonl

@@ -6,7 +6,12 @@ import math
 from pathlib import Path
 from typing import Any
 
-from src.sec_data import FINANCIAL_METRICS, PANEL_TICKERS, TARGET_FISCAL_YEARS
+from src.sec_data import (
+    COMPANY_PANEL,
+    FINANCIAL_METRICS,
+    PANEL_TICKERS,
+    TARGET_FISCAL_YEARS,
+)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_FACTS_PATH = BASE_DIR / "data" / "processed" / "facts.jsonl"
@@ -18,8 +23,21 @@ SUPPORTED_METRICS: set[str] = set(FINANCIAL_METRICS.keys())
 ALLOWED_STATUSES = {"found", "missing", "ambiguous"}
 REQUIRED_FIELDS = ("ticker", "fiscal_year", "metric", "status", "value", "unit")
 
-# Bank-specific net revenue concepts that are not comparable to commercial gross sales
-BANK_REVENUE_TAGS = frozenset({"RevenuesNetOfInterestExpense"})
+# Financial-services companies from approved panel (banks / broker-dealers)
+FINANCIAL_SERVICES_TICKERS: frozenset[str] = frozenset(
+    COMPANY_PANEL.get("Financial services", ["JPM", "BAC", "WFC", "GS", "MS", "C"])
+)
+
+# Recognized bank net revenue concepts
+BANK_REVENUE_TAGS: frozenset[str] = frozenset({"RevenuesNetOfInterestExpense", "Revenues"})
+
+# Recognized commercial revenue concepts
+COMMERCIAL_REVENUE_TAGS: frozenset[str] = frozenset({
+    "RevenueFromContractWithCustomerExcludingAssessedTax",
+    "Revenues",
+    "SalesRevenueNet",
+    "RegulatedAndUnregulatedOperatingRevenue",
+})
 
 RATIO_DEFINITIONS: dict[str, dict[str, str]] = {
     "operating_margin": {
@@ -43,11 +61,38 @@ RATIO_DEFINITIONS: dict[str, dict[str, str]] = {
 }
 
 
+def validate_monetary_value(val: Any, context: str = "") -> int:
+    """Validate that monetary fact value is an exact integer whole USD amount.
+
+    Rejects booleans, strings, nonfinite numbers, and fractional values.
+    Returns exact int without silent rounding or truncation.
+    """
+    if isinstance(val, bool):
+        raise ValueError(f"Invalid monetary value {val!r}{context}: boolean is not allowed.")
+    if isinstance(val, str):
+        raise ValueError(f"Invalid monetary value {val!r}{context}: string is not allowed.")
+    if isinstance(val, float):
+        if not math.isfinite(val):
+            raise ValueError(f"Invalid monetary value {val!r}{context}: nonfinite float is not allowed.")
+        if not val.is_integer():
+            raise ValueError(f"Invalid monetary value {val!r}{context}: fractional monetary values are not supported.")
+        return int(val)
+    if isinstance(val, Decimal):
+        if not val.is_finite():
+            raise ValueError(f"Invalid monetary value {val!r}{context}: nonfinite Decimal is not allowed.")
+        if val != val.to_integral_value():
+            raise ValueError(f"Invalid monetary value {val!r}{context}: fractional monetary values are not supported.")
+        return int(val)
+    if isinstance(val, int):
+        return val
+    raise ValueError(f"Invalid monetary value {val!r}{context}: unsupported type {type(val)}.")
+
+
 def load_facts(path: Path | None = None) -> dict[tuple[str, int, str], dict[str, Any]]:
     """Load and validate financial fact records from a JSONL file.
 
     Indexes records by (ticker, fiscal_year, metric).
-    Rejects duplicate keys, invalid values, and non-conforming records.
+    Rejects duplicate keys, invalid values, fractional amounts, and non-conforming records.
     """
     facts_path = Path(path) if path is not None else DEFAULT_FACTS_PATH
     if not facts_path.is_file():
@@ -96,8 +141,12 @@ def load_facts(path: Path | None = None) -> dict[tuple[str, int, str], dict[str,
 
                 val = record.get("value")
                 if status == "found":
-                    if isinstance(val, bool) or not isinstance(val, (int, float)) or not math.isfinite(val):
-                        raise ValueError(f"Invalid financial value {val!r} for found record on line {line_no}.")
+                    try:
+                        clean_val = validate_monetary_value(val, f" on line {line_no}")
+                    except ValueError as exc:
+                        raise ValueError(f"Invalid financial value on line {line_no}: {exc}") from exc
+                    record["value"] = clean_val
+
                     if record.get("unit") != "USD":
                         raise ValueError(f"Invalid unit '{record.get('unit')}' for found record on line {line_no}.")
                     for str_field in ("accession", "period_end", "source_url"):
@@ -244,8 +293,18 @@ def calculate_growth(
                 ),
             }
 
-    old_val = start_fact["value"]
-    new_val = end_fact["value"]
+    try:
+        old_val = validate_monetary_value(start_fact["value"], f" for {ticker_clean} FY{start_year} {metric_clean}")
+        new_val = validate_monetary_value(end_fact["value"], f" for {ticker_clean} FY{end_year} {metric_clean}")
+    except ValueError as exc:
+        return {
+            "status": "unavailable",
+            "ticker": ticker_clean,
+            "metric": metric_clean,
+            "start_year": start_year,
+            "end_year": end_year,
+            "reason": f"Monetary validation error: {exc}",
+        }
 
     if old_val <= 0:
         return {
@@ -375,8 +434,17 @@ def calculate_ratio(
             "reason": f"Selection policy mismatch: '{num_metric}' ('{pol_num}') vs '{den_metric}' ('{pol_den}').",
         }
 
-    num_val = num_fact["value"]
-    den_val = den_fact["value"]
+    try:
+        num_val = validate_monetary_value(num_fact["value"], f" for {ticker_clean} FY{fiscal_year} {num_metric}")
+        den_val = validate_monetary_value(den_fact["value"], f" for {ticker_clean} FY{fiscal_year} {den_metric}")
+    except ValueError as exc:
+        return {
+            "status": "unavailable",
+            "ticker": ticker_clean,
+            "fiscal_year": fiscal_year,
+            "ratio": ratio_def["display_name"],
+            "reason": f"Monetary validation error: {exc}",
+        }
 
     if den_val <= 0:
         return {
@@ -445,7 +513,7 @@ def compare_companies(
     """Compare a financial metric between two companies for a target fiscal year.
 
     Guarantees bank net revenue is not treated as equivalent to commercial gross sales.
-    Calculates differences with exact integer USD precision.
+    Calculates differences with exact integer USD precision without silent truncation.
     """
     fact_a = get_fact(ticker_a, fiscal_year, metric, facts)
     fact_b = get_fact(ticker_b, fiscal_year, metric, facts)
@@ -488,33 +556,54 @@ def compare_companies(
             "reason": f"Incompatible units: {t_a} ({unit_a}) vs {t_b} ({unit_b}).",
         }
 
-    val_a = fact_a["value"]
-    val_b = fact_b["value"]
+    try:
+        clean_a = validate_monetary_value(fact_a["value"], f" for {t_a} FY{fiscal_year} {m_clean}")
+        clean_b = validate_monetary_value(fact_b["value"], f" for {t_b} FY{fiscal_year} {m_clean}")
+    except ValueError as exc:
+        return {
+            "status": "unavailable",
+            "ticker_a": t_a,
+            "ticker_b": t_b,
+            "fiscal_year": fiscal_year,
+            "metric": m_clean,
+            "reason": f"Monetary validation error: {exc}",
+        }
+
     end_a = fact_a.get("period_end")
     end_b = fact_b.get("period_end")
     tag_a = fact_a.get("tag")
     tag_b = fact_b.get("tag")
 
-    # Semantic revenue comparability check: bank net revenue vs commercial revenue
+    # Semantic revenue comparability check:
+    # 1. Bank net revenue versus commercial sales (determined by panel sector, not only tag)
+    # 2. Accounting concept verification
     if m_clean == "revenue":
-        is_bank_a = tag_a in BANK_REVENUE_TAGS
-        is_bank_b = tag_b in BANK_REVENUE_TAGS
-        if is_bank_a != is_bank_b:
+        is_fin_a = t_a in FINANCIAL_SERVICES_TICKERS
+        is_fin_b = t_b in FINANCIAL_SERVICES_TICKERS
+
+        # Rule: A bank-versus-nonbank revenue comparison must return not_comparable,
+        # even if both companies use the generic 'Revenues' tag.
+        if is_fin_a != is_fin_b:
+            bank_ticker = t_a if is_fin_a else t_b
+            comm_ticker = t_b if is_fin_a else t_a
+            bank_tag = tag_a if is_fin_a else tag_b
+            comm_tag = tag_b if is_fin_a else tag_a
             return {
                 "status": "not_comparable",
                 "fiscal_year": fiscal_year,
                 "metric": m_clean,
                 "unit": unit_a,
                 "reason": (
-                    f"Revenue concepts are materially incompatible: {t_a} reported "
-                    f"{'bank net revenue' if is_bank_a else 'commercial revenue'} ('{tag_a}'), while {t_b} reported "
-                    f"{'bank net revenue' if is_bank_b else 'commercial revenue'} ('{tag_b}'). "
+                    f"Revenue concepts are materially incompatible: {bank_ticker} is a financial services "
+                    f"institution reporting bank net revenue ('{bank_tag}'), while {comm_ticker} is a commercial "
+                    f"company reporting commercial revenue ('{comm_tag}'). "
                     f"Bank net interest revenue cannot be directly compared to commercial sales."
                 ),
                 "company_a": {
                     "ticker": t_a,
                     "company_name": fact_a.get("company_name"),
-                    "value": val_a,
+                    "sector": fact_a.get("sector", PANEL_TICKERS.get(t_a, "")),
+                    "value": clean_a,
                     "period_end": end_a,
                     "tag": tag_a,
                     "accession": fact_a.get("accession"),
@@ -523,7 +612,8 @@ def compare_companies(
                 "company_b": {
                     "ticker": t_b,
                     "company_name": fact_b.get("company_name"),
-                    "value": val_b,
+                    "sector": fact_b.get("sector", PANEL_TICKERS.get(t_b, "")),
+                    "value": clean_b,
                     "period_end": end_b,
                     "tag": tag_b,
                     "accession": fact_b.get("accession"),
@@ -543,7 +633,77 @@ def compare_companies(
                 ],
             }
 
-    diff = int(Decimal(str(val_a)) - Decimal(str(val_b)))
+        # If both are banks or both are commercial companies:
+        if is_fin_a and is_fin_b:
+            # Both are financial services companies
+            if tag_a not in BANK_REVENUE_TAGS or tag_b not in BANK_REVENUE_TAGS:
+                return {
+                    "status": "not_comparable",
+                    "fiscal_year": fiscal_year,
+                    "metric": m_clean,
+                    "unit": unit_a,
+                    "reason": f"Revenue accounting concepts cannot be established as comparable ({t_a}: '{tag_a}', {t_b}: '{tag_b}').",
+                    "company_a": {
+                        "ticker": t_a,
+                        "company_name": fact_a.get("company_name"),
+                        "sector": fact_a.get("sector", PANEL_TICKERS.get(t_a, "")),
+                        "value": clean_a,
+                        "period_end": end_a,
+                        "tag": tag_a,
+                        "accession": fact_a.get("accession"),
+                        "source_url": fact_a.get("source_url"),
+                    },
+                    "company_b": {
+                        "ticker": t_b,
+                        "company_name": fact_b.get("company_name"),
+                        "sector": fact_b.get("sector", PANEL_TICKERS.get(t_b, "")),
+                        "value": clean_b,
+                        "period_end": end_b,
+                        "tag": tag_b,
+                        "accession": fact_b.get("accession"),
+                        "source_url": fact_b.get("source_url"),
+                    },
+                    "sources": [
+                        {"ticker": t_a, "accession": fact_a.get("accession"), "source_url": fact_a.get("source_url")},
+                        {"ticker": t_b, "accession": fact_b.get("accession"), "source_url": fact_b.get("source_url")},
+                    ],
+                }
+        else:
+            # Both are commercial companies
+            if tag_a not in COMMERCIAL_REVENUE_TAGS or tag_b not in COMMERCIAL_REVENUE_TAGS:
+                return {
+                    "status": "not_comparable",
+                    "fiscal_year": fiscal_year,
+                    "metric": m_clean,
+                    "unit": unit_a,
+                    "reason": f"Revenue accounting concepts cannot be established as comparable ({t_a}: '{tag_a}', {t_b}: '{tag_b}').",
+                    "company_a": {
+                        "ticker": t_a,
+                        "company_name": fact_a.get("company_name"),
+                        "sector": fact_a.get("sector", PANEL_TICKERS.get(t_a, "")),
+                        "value": clean_a,
+                        "period_end": end_a,
+                        "tag": tag_a,
+                        "accession": fact_a.get("accession"),
+                        "source_url": fact_a.get("source_url"),
+                    },
+                    "company_b": {
+                        "ticker": t_b,
+                        "company_name": fact_b.get("company_name"),
+                        "sector": fact_b.get("sector", PANEL_TICKERS.get(t_b, "")),
+                        "value": clean_b,
+                        "period_end": end_b,
+                        "tag": tag_b,
+                        "accession": fact_b.get("accession"),
+                        "source_url": fact_b.get("source_url"),
+                    },
+                    "sources": [
+                        {"ticker": t_a, "accession": fact_a.get("accession"), "source_url": fact_a.get("source_url")},
+                        {"ticker": t_b, "accession": fact_b.get("accession"), "source_url": fact_b.get("source_url")},
+                    ],
+                }
+
+    diff = clean_a - clean_b
 
     notes: list[str] = []
     if end_a != end_b:
@@ -552,9 +712,14 @@ def compare_companies(
         )
 
     if m_clean == "revenue" and tag_a != tag_b:
-        notes.append(
-            f"Revenue accounting tags differ: {t_a} reported '{tag_a}', while {t_b} reported '{tag_b}'. Concepts may not be perfectly equivalent."
-        )
+        if is_fin_a and is_fin_b:
+            notes.append(
+                f"Both companies are financial institutions reporting bank net revenue, but accounting tags differ ({t_a}: '{tag_a}', {t_b}: '{tag_b}')."
+            )
+        else:
+            notes.append(
+                f"Revenue accounting tags differ: {t_a} reported '{tag_a}', while {t_b} reported '{tag_b}'. Concepts may not be perfectly equivalent."
+            )
 
     return {
         "status": "success",
@@ -565,7 +730,8 @@ def compare_companies(
         "company_a": {
             "ticker": t_a,
             "company_name": fact_a.get("company_name"),
-            "value": val_a,
+            "sector": fact_a.get("sector", PANEL_TICKERS.get(t_a, "")),
+            "value": clean_a,
             "period_end": end_a,
             "tag": tag_a,
             "accession": fact_a.get("accession"),
@@ -574,7 +740,8 @@ def compare_companies(
         "company_b": {
             "ticker": t_b,
             "company_name": fact_b.get("company_name"),
-            "value": val_b,
+            "sector": fact_b.get("sector", PANEL_TICKERS.get(t_b, "")),
+            "value": clean_b,
             "period_end": end_b,
             "tag": tag_b,
             "accession": fact_b.get("accession"),
@@ -604,6 +771,7 @@ def calculate_net_assets(
     """Calculate Net assets = Assets - Liabilities for a company in a fiscal year.
 
     Requires both facts to be found, with identical unit, period_end, and selection policy.
+    Preserves exact integer USD precision without silent truncation.
     Returns unavailable if either fact is missing (e.g. companies not reporting separate liabilities).
     """
     assets_fact = get_fact(ticker, fiscal_year, "assets", facts)
@@ -659,9 +827,18 @@ def calculate_net_assets(
             "reason": f"Selection policy mismatch: assets ('{pol_a}') vs liabilities ('{pol_l}').",
         }
 
-    val_a = assets_fact["value"]
-    val_l = liabilities_fact["value"]
-    net_assets = int(Decimal(str(val_a)) - Decimal(str(val_l)))
+    try:
+        clean_a = validate_monetary_value(assets_fact["value"], f" for {ticker_clean} FY{fiscal_year} assets")
+        clean_l = validate_monetary_value(liabilities_fact["value"], f" for {ticker_clean} FY{fiscal_year} liabilities")
+    except ValueError as exc:
+        return {
+            "status": "unavailable",
+            "ticker": ticker_clean,
+            "fiscal_year": fiscal_year,
+            "reason": f"Monetary validation error: {exc}",
+        }
+
+    net_assets = clean_a - clean_l
 
     return {
         "status": "success",
@@ -672,8 +849,8 @@ def calculate_net_assets(
         "formula": "assets - liabilities",
         "period_end": end_a,
         "inputs": {
-            "assets": val_a,
-            "liabilities": val_l,
+            "assets": clean_a,
+            "liabilities": clean_l,
         },
         "sources": [
             {
