@@ -1,0 +1,142 @@
+{
+  "evaluation_type": "retrieval",
+  "evaluation_status": "provisional_human_review_pending",
+  "evaluation_question_count": 25,
+  "sec_filing_count": 10,
+  "indexed_chunk_count": 3409,
+  "question_file_sha256": "57e9313f814cadab5c2ecc615ff7d4872401fdff8db9012f3a546223aa88ac48",
+  "corpus_file_sha256": "7725ef4ff00f9bfc99de3fe8dc1193c1b694a8cadb34b84dcfbe69bd74c6830e",
+  "top_k": 5,
+  "recall_at_top_k": 0.76,
+  "mrr": 0.5047,
+  "hits": 19,
+  "misses": 6,
+  "results_by_difficulty": {
+    "easy": {
+      "total": 8,
+      "hits": 6,
+      "recall": 0.75,
+      "mrr": 0.4271
+    },
+    "medium": {
+      "total": 12,
+      "hits": 9,
+      "recall": 0.75,
+      "mrr": 0.5306
+    },
+    "hard": {
+      "total": 5,
+      "hits": 4,
+      "recall": 0.8,
+      "mrr": 0.5667
+    }
+  },
+  "results_by_topic": {
+    "Risk Factors": {
+      "total": 10,
+      "hits": 8,
+      "recall": 0.8,
+      "mrr": 0.5417
+    },
+    "Business / MD&A": {
+      "total": 10,
+      "hits": 7,
+      "recall": 0.7,
+      "mrr": 0.4367
+    },
+    "Financial-table or filing-specific evidence": {
+      "total": 5,
+      "hits": 4,
+      "recall": 0.8,
+      "mrr": 0.5667
+    }
+  },
+  "results_by_sector": {
+    "Technology": {
+      "total": 5,
+      "hits": 4,
+      "recall": 0.8,
+      "mrr": 0.5667
+    },
+    "Financial services": {
+      "total": 5,
+      "hits": 5,
+      "recall": 1.0,
+      "mrr": 0.8667
+    },
+    "Healthcare": {
+      "total": 5,
+      "hits": 3,
+      "recall": 0.6,
+      "mrr": 0.2167
+    },
+    "Energy and utilities": {
+      "total": 5,
+      "hits": 3,
+      "recall": 0.6,
+      "mrr": 0.4667
+    },
+    "Consumer": {
+      "total": 5,
+      "hits": 4,
+      "recall": 0.8,
+      "mrr": 0.4067
+    }
+  },
+  "index_build_time_sec": 0.6299,
+  "avg_search_time_sec": 0.001,
+  "missing_questions": [
+    {
+      "id": "RETR_001",
+      "ticker": "MSFT",
+      "fiscal_year": 2024,
+      "difficulty": "easy",
+      "topic": "Risk Factors",
+      "technical_reason": "Relevant passage present in corpus but ranked below top-k cutoff"
+    },
+    {
+      "id": "RETR_013",
+      "ticker": "JNJ",
+      "fiscal_year": 2025,
+      "difficulty": "medium",
+      "topic": "Risk Factors",
+      "technical_reason": "Relevant passage present in corpus but ranked below top-k cutoff"
+    },
+    {
+      "id": "RETR_015",
+      "ticker": "JNJ",
+      "fiscal_year": 2025,
+      "difficulty": "hard",
+      "topic": "Financial-table or filing-specific evidence",
+      "technical_reason": "Relevant passage present in corpus but ranked below top-k cutoff"
+    },
+    {
+      "id": "RETR_017",
+      "ticker": "XOM",
+      "fiscal_year": 2024,
+      "difficulty": "medium",
+      "topic": "Business / MD&A",
+      "technical_reason": "Relevant passage present in corpus but ranked below top-k cutoff"
+    },
+    {
+      "id": "RETR_020",
+      "ticker": "DUK",
+      "fiscal_year": 2025,
+      "difficulty": "medium",
+      "topic": "Business / MD&A",
+      "technical_reason": "Relevant passage present in corpus but ranked below top-k cutoff"
+    },
+    {
+      "id": "RETR_024",
+      "ticker": "MCD",
+      "fiscal_year": 2023,
+      "difficulty": "easy",
+      "topic": "Business / MD&A",
+      "technical_reason": "Relevant passage present in corpus but ranked below top-k cutoff"
+    }
+  ],
+  "notes": {
+    "scope": "Evaluates BM25 evidence retrieval over SEC Form 10-K filings; does not measure LLM generation, arithmetic correctness, or multi-hop reasoning.",
+    "human_review": "Candidate gold labels verified by author; independent human review remains pending."
+  }
+}
