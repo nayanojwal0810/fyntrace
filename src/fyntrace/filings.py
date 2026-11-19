@@ -489,6 +489,54 @@ def _get_section_for_offset(
     return "unknown", "unknown"
 
 
+def split_long_paragraph(
+    canonical_text: str,
+    p_start: int,
+    p_end: int,
+    max_words: int = 500,
+    target_words: int = 400,
+    overlap_words: int = 50,
+) -> list[tuple[int, int]]:
+    """Split an oversized paragraph into spans of at most max_words with overlap."""
+    p_text = canonical_text[p_start:p_end]
+    words = list(re.finditer(r"\S+", p_text))
+    if len(words) <= max_words:
+        return [(p_start, p_end)]
+
+    slices: list[tuple[int, int]] = []
+    w_idx = 0
+    while w_idx < len(words):
+        w_end = min(w_idx + target_words, len(words))
+        if w_end < len(words):
+            sentence_break = None
+            search_start = min(w_idx + 350, len(words) - 1)
+            search_end = min(w_idx + max_words, len(words))
+            for i in range(search_start, search_end):
+                w_str = words[i].group(0)
+                if w_str.endswith((".", "!", "?")) and not re.search(
+                    r"\b(?:[A-Z]\.|Inc\.|Corp\.|Ltd\.|Co\.|U\.S\.|e\.g\.|i\.e\.|vs\.|No\.)",
+                    w_str,
+                ):
+                    sentence_break = i + 1
+                    break
+            if sentence_break is not None:
+                w_end = sentence_break
+            else:
+                w_end = min(w_idx + max_words, len(words))
+
+        c_start = p_start + words[w_idx].start()
+        c_end = p_start + words[w_end - 1].end()
+        slices.append((c_start, c_end))
+
+        if w_end >= len(words):
+            break
+
+        next_w_idx = max(w_idx + 1, w_end - overlap_words)
+        w_idx = next_w_idx
+
+    return slices
+
+
 def make_chunks(
     filing: dict[str, Any],
     canonical_text: str,
@@ -650,14 +698,57 @@ def make_chunks(
 
                 p_idx = 0
                 while p_idx < len(para_spans):
-                    c_start = para_spans[p_idx][0]
+                    p_start, p_end = para_spans[p_idx]
+                    p_words = len(canonical_text[p_start:p_end].split())
+
+                    # Split oversized paragraph (> max_words) directly into chunks
+                    if p_words > max_words:
+                        long_slices = split_long_paragraph(
+                            canonical_text,
+                            p_start,
+                            p_end,
+                            max_words=max_words,
+                            target_words=target_words,
+                            overlap_words=overlap_words,
+                        )
+                        for c_start, c_end in long_slices:
+                            c_text = canonical_text[c_start:c_end]
+                            chunk_id = f"{filing['ticker']}_{filing['fiscal_year']}_{clean_form}_{clean_accn}_{chunk_seq:05d}"
+                            chunk_seq += 1
+                            chunks.append({
+                                "chunk_id": chunk_id,
+                                "ticker": filing["ticker"],
+                                "cik": filing["cik"],
+                                "fiscal_year": filing["fiscal_year"],
+                                "form": filing["form"],
+                                "accession": filing["accession"],
+                                "section": sec_name,
+                                "section_confidence": sec_conf,
+                                "chunk_type": "text",
+                                "text": c_text,
+                                "char_start": c_start,
+                                "char_end": c_end,
+                                "source_url": filing["source_url"],
+                                "source_file_sha256": filing["file_sha256"],
+                                "canonical_text_path": filing.get("canonical_text_path"),
+                                "filing_date": filing.get("filing_date"),
+                                "period_end_date": filing.get("period_end_date"),
+                                "table_title": None,
+                            })
+                        p_idx += 1
+                        continue
+
+                    # Accumulate normal paragraphs up to max_words
+                    c_start = p_start
                     cur_end_p = p_idx
                     cur_words = 0
 
                     while cur_end_p < len(para_spans):
-                        p_start, p_end = para_spans[cur_end_p]
-                        pw = len(canonical_text[p_start:p_end].split())
+                        nxt_start, nxt_end = para_spans[cur_end_p]
+                        pw = len(canonical_text[nxt_start:nxt_end].split())
                         if cur_words + pw > max_words and cur_end_p > p_idx:
+                            break
+                        if pw > max_words and cur_end_p > p_idx:
                             break
                         cur_words += pw
                         cur_end_p += 1
@@ -691,6 +782,7 @@ def make_chunks(
                     if cur_end_p >= len(para_spans):
                         break
 
+                    # Advance with ~50 words overlap among normal paragraphs
                     overlap_accum = 0
                     step_back = 0
                     for back_idx in range(cur_end_p - 1, p_idx, -1):
@@ -719,8 +811,8 @@ def build_filing_corpus(
 ) -> dict[str, Any]:
     """Process all validated annual filings and create data/processed/chunks.jsonl.
 
-    Writes canonical text files to data/processed/text/ and uses atomic
-    replacement for chunks.jsonl.
+    Stages newly generated canonical text in a temporary directory and uses
+    atomic replacement directly for chunks.jsonl only after all filings succeed.
     """
     proc_dir = Path(processed_dir) if processed_dir else DEFAULT_PROCESSED_DIR
     proc_dir.mkdir(parents=True, exist_ok=True)
@@ -731,6 +823,9 @@ def build_filing_corpus(
     canonical_dir = proc_dir / "text"
     canonical_dir.mkdir(parents=True, exist_ok=True)
 
+    # Temporary staging paths
+    tmp_canonical_dir = proc_dir / "text_tmp"
+    tmp_canonical_dir.mkdir(parents=True, exist_ok=True)
     tmp_chunks_path = proc_dir / "chunks.jsonl.tmp"
     final_chunks_path = proc_dir / "chunks.jsonl"
 
@@ -751,10 +846,14 @@ def build_filing_corpus(
                 clean_accn = filing["accession"].replace("-", "")
                 clean_form = filing["form"].replace("-", "")
                 txt_filename = f"{filing['ticker']}_{filing['fiscal_year']}_{clean_form}_{clean_accn}.txt"
-                txt_path = canonical_dir / txt_filename
-                txt_path.write_text(canonical_text, encoding="utf-8")
 
-                filing["canonical_text_path"] = str(txt_path.as_posix())
+                # Stage text file in temporary directory
+                staged_txt_path = tmp_canonical_dir / txt_filename
+                staged_txt_path.write_text(canonical_text, encoding="utf-8")
+
+                # Store the final canonical text path in chunk metadata
+                final_txt_path = canonical_dir / txt_filename
+                filing["canonical_text_path"] = str(final_txt_path.as_posix())
 
                 sections = extract_sections(canonical_text)
                 chunks = make_chunks(filing, canonical_text, sections)
@@ -775,15 +874,27 @@ def build_filing_corpus(
 
                     out_f.write(json.dumps(chunk, ensure_ascii=False) + "\n")
 
-        # Atomic replacement of finalized chunks file
-        if final_chunks_path.is_file():
-            final_chunks_path.unlink()
+        # Move staged canonical text files into the final directory after all filings succeed
+        for staged_file in tmp_canonical_dir.iterdir():
+            if staged_file.is_file():
+                dest_file = canonical_dir / staged_file.name
+                staged_file.replace(dest_file)
+
+        # Atomic replacement directly from the completed temporary file (no prior deletion)
         tmp_chunks_path.replace(final_chunks_path)
 
-    except Exception:
+    finally:
+        # Clean up temporary files after success or failure
         if tmp_chunks_path.is_file():
-            tmp_chunks_path.unlink()
-        raise
+            tmp_chunks_path.unlink(missing_ok=True)
+        if tmp_canonical_dir.is_dir():
+            for leftover in tmp_canonical_dir.iterdir():
+                if leftover.is_file():
+                    leftover.unlink(missing_ok=True)
+            try:
+                tmp_canonical_dir.rmdir()
+            except OSError:
+                pass
 
     summary = {
         "filings_expected": len(validated_filings),

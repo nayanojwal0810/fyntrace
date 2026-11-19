@@ -479,3 +479,131 @@ def test_no_unexpected_network_request_occurs(tmp_path):
     info = inspect_filing_corpus(ticker="MSFT", year=2024, processed_dir=proc_dir)
     assert info["ticker"] == "MSFT"
     assert info["fiscal_year"] == 2024
+
+
+def test_extraction_failure_after_earlier_filing_leaves_corpus_and_canonical_text_unchanged(tmp_path, monkeypatch):
+    """An extraction failure after an earlier filing has processed does not modify existing corpus or text."""
+    raw_dir = tmp_path / "raw"
+    processed_dir = tmp_path / "processed"
+    filings_dir = raw_dir / "filings"
+    filings_dir.mkdir(parents=True, exist_ok=True)
+    processed_dir.mkdir(parents=True, exist_ok=True)
+
+    html1 = b"<!DOCTYPE html><html><body><h1>ITEM 1. BUSINESS</h1><p>" + b"Apple designs and sells hardware devices and software systems globally. " * 10 + b"</p></body></html>"
+    f1 = filings_dir / "AAPL_2024_000032019324000123.html"
+    f1.write_bytes(html1)
+
+    html2 = b"<!DOCTYPE html><html><body><h1>ITEM 1. BUSINESS</h1><p>" + b"Microsoft develops and supports software and cloud infrastructure. " * 10 + b"</p></body></html>"
+    f2 = filings_dir / "MSFT_2024_000095017024087843.html"
+    f2.write_bytes(html2)
+
+    manifest_data = {
+        "company_identities": [
+            {"ticker": "AAPL", "cik": "0000320193", "name": "Apple Inc.", "sector": "Technology"},
+            {"ticker": "MSFT", "cik": "0000789019", "name": "Microsoft Corporation", "sector": "Technology"},
+        ],
+        "filings": [
+            {
+                "ticker": "AAPL",
+                "fiscal_year": 2024,
+                "status": "downloaded",
+                "form": "10-K",
+                "accession": "0000320193-24-000123",
+                "local_path": str(f1.as_posix()),
+                "source_url": "https://www.sec.gov/Archives/edgar/data/320193/000032019324000123/aapl-20240928.htm",
+                "file_sha256": hashlib.sha256(html1).hexdigest(),
+                "filing_date": "2024-11-01",
+                "period_end_date": "2024-09-28",
+                "primary_document": "aapl-20240928.htm",
+                "selected_metrics": ["revenue"],
+                "unavailable_metrics": {},
+                "errors": [],
+            },
+            {
+                "ticker": "MSFT",
+                "fiscal_year": 2024,
+                "status": "downloaded",
+                "form": "10-K",
+                "accession": "0000950170-24-087843",
+                "local_path": str(f2.as_posix()),
+                "source_url": "https://www.sec.gov/Archives/edgar/data/789019/000095017024087843/msft-20240630.htm",
+                "file_sha256": hashlib.sha256(html2).hexdigest(),
+                "filing_date": "2024-07-30",
+                "period_end_date": "2024-06-30",
+                "primary_document": "msft-20240630.htm",
+                "selected_metrics": ["revenue"],
+                "unavailable_metrics": {},
+                "errors": [],
+            },
+        ],
+    }
+    (processed_dir / "manifest.json").write_text(json.dumps(manifest_data), encoding="utf-8")
+
+    # Initial successful build
+    summary = build_filing_corpus(processed_dir=processed_dir, raw_dir=raw_dir)
+    assert summary["filings_processed"] == 2
+    chunks_file = processed_dir / "chunks.jsonl"
+    orig_chunks_bytes = chunks_file.read_bytes()
+    aapl_txt = processed_dir / "text" / "AAPL_2024_10K_000032019324000123.txt"
+    msft_txt = processed_dir / "text" / "MSFT_2024_10K_000095017024087843.txt"
+    orig_aapl_bytes = aapl_txt.read_bytes()
+    orig_msft_bytes = msft_txt.read_bytes()
+
+    # Now simulate an extraction failure on the second filing (MSFT)
+    real_extract = extract_visible_text
+    def failing_extract(html_bytes):
+        if b"Microsoft" in html_bytes:
+            raise RuntimeError("Simulated mid-build extraction failure on second filing.")
+        return real_extract(html_bytes)
+
+    monkeypatch.setattr("fyntrace.filings.extract_visible_text", failing_extract)
+
+    with pytest.raises(RuntimeError, match="Simulated mid-build extraction failure"):
+        build_filing_corpus(processed_dir=processed_dir, raw_dir=raw_dir)
+
+    # Ensure previous corpus and canonical texts remain completely unchanged
+    assert chunks_file.read_bytes() == orig_chunks_bytes
+    assert aapl_txt.read_bytes() == orig_aapl_bytes
+    assert msft_txt.read_bytes() == orig_msft_bytes
+
+    # Ensure no temporary files or directories remain
+    assert not (processed_dir / "chunks.jsonl.tmp").exists()
+    assert not (processed_dir / "text_tmp").exists()
+
+
+def test_single_paragraph_longer_than_1000_words_split_into_valid_chunks(tmp_path):
+    """One paragraph longer than 1,000 words is split into valid chunks of at most 500 words with exact offsets."""
+    _, _, manifest_path, _, _ = _make_sample_filing_data(tmp_path)
+    filings = load_validated_filings(manifest_path, raw_dir=tmp_path / "raw")
+
+    # Create one continuous paragraph of 1,200 words
+    words = [f"word{i}" + ("." if i % 20 == 0 else "") for i in range(1200)]
+    long_p = " ".join(words)
+    canonical_text = f"ITEM 1A. RISK FACTORS\n\n{long_p}"
+
+    sections = extract_sections(canonical_text)
+    chunks = make_chunks(filings[0], canonical_text, sections)
+
+    assert len(chunks) >= 3
+
+    for chunk in chunks:
+        # Maximum 500 words per narrative chunk
+        w_count = len(chunk["text"].split())
+        assert w_count <= 500, f"Chunk {chunk['chunk_id']} has {w_count} words > 500"
+        # Exact character offset invariant
+        start = chunk["char_start"]
+        end = chunk["char_end"]
+        assert canonical_text[start:end] == chunk["text"]
+        # Section isolated
+        assert chunk["section"] == "Item 1A - Risk Factors"
+
+    # The oversized paragraph was split into chunks[1:] (chunks[0] is the section heading)
+    p_chunks = [c for c in chunks if "word" in c["text"]]
+    assert len(p_chunks) >= 3
+
+    for idx in range(1, len(p_chunks)):
+        prev_end = p_chunks[idx - 1]["char_end"]
+        curr_start = p_chunks[idx]["char_start"]
+        overlap_text = canonical_text[curr_start:prev_end]
+        overlap_words = len(overlap_text.split())
+        assert 40 <= overlap_words <= 65, f"Overlap between chunk {idx-1} and {idx} is {overlap_words} words"
