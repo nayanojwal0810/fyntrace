@@ -41,6 +41,13 @@ VALID_CATEGORIES: set[str] = {
 
 VALID_DIFFICULTIES: set[str] = {"easy", "medium", "hard"}
 
+ALLOWED_AUDIT_DECISIONS: set[str] = {
+    "verified",
+    "corrected_gold",
+    "corrected_question",
+    "unresolved",
+}
+
 EXPECTED_SECTOR_COUNTS: dict[str, int] = {
     "Technology": 20,
     "Finance": 20,
@@ -62,6 +69,23 @@ EXPECTED_DIFFICULTY_COUNTS: dict[str, int] = {
     "medium": 40,
     "hard": 40,
 }
+
+MANDATORY_QUESTION_FIELDS: tuple[str, ...] = (
+    "question_id",
+    "query",
+    "ticker",
+    "fiscal_year",
+    "sector",
+    "category",
+    "difficulty",
+    "gold_chunk_ids",
+    "evidence_excerpt",
+    "accession",
+    "source_url",
+    "section",
+    "chunk_type",
+    "corpus_sha256",
+)
 
 
 def load_questions(path: Path | str) -> list[dict[str, Any]]:
@@ -89,6 +113,31 @@ def load_questions(path: Path | str) -> list[dict[str, Any]]:
     return questions
 
 
+def load_audit(path: Path | str) -> list[dict[str, Any]]:
+    """Load local audit records from a JSONL file."""
+    p = Path(path)
+    if not p.is_file():
+        raise FileNotFoundError(f"Audit file not found: {p}")
+
+    records: list[dict[str, Any]] = []
+    with p.open("r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            line_str = line.strip()
+            if not line_str:
+                continue
+            try:
+                obj = json.loads(line_str)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Line {line_no} in audit file {p} is malformed JSON: {e}")
+            if not isinstance(obj, dict):
+                raise ValueError(f"Line {line_no} in audit file {p} must be a JSON object")
+            records.append(obj)
+
+    if not records:
+        raise ValueError(f"Audit file {p} is empty or contains no valid records.")
+    return records
+
+
 def _normalize_category(cat: str) -> str:
     """Normalize category names to standard keys."""
     c = cat.strip().lower()
@@ -103,6 +152,7 @@ def validate_questions(
     chunks_path: Path | str,
     text_dir: Path | str | None = None,
     enforce_100_dist: bool = True,
+    check_canonical_text: bool = True,
 ) -> dict[str, Any]:
     """Validate question records against corpus, SQLite index, and specifications."""
     if not questions:
@@ -126,12 +176,28 @@ def validate_questions(
             f"but database recorded {db_corpus_sha256}"
         )
 
-    # 2. Check 100-count requirements if full dev set
-    if enforce_100_dist:
-        if len(questions) != 100:
-            raise ValueError(f"Expected exactly 100 questions, got {len(questions)}")
+    # 2. Check 100-count requirements if production dev set
+    if enforce_100_dist and len(questions) != 100:
+        raise ValueError(f"Expected exactly 100 questions, got {len(questions)}")
 
-    # 3. Connect to DB to load chunk metadata
+    # 3. Check mandatory fields and duplicate IDs upfront
+    seen_ids: set[str] = set()
+    for idx, q in enumerate(questions, start=1):
+        for field in MANDATORY_QUESTION_FIELDS:
+            val = q.get(field)
+            if val is None:
+                raise ValueError(f"Question #{idx} missing mandatory field '{field}'")
+            if isinstance(val, str) and not val.strip():
+                raise ValueError(f"Question #{idx} has empty field '{field}'")
+            if isinstance(val, list) and len(val) == 0:
+                raise ValueError(f"Question #{idx} has empty list field '{field}'")
+
+        qid = q["question_id"]
+        if qid in seen_ids:
+            raise ValueError(f"Duplicate question_id '{qid}' at #{idx}")
+        seen_ids.add(qid)
+
+    # 4. Connect to DB to load chunk metadata
     con = sqlite3.connect(str(db_file))
     con.row_factory = sqlite3.Row
     try:
@@ -145,68 +211,48 @@ def validate_questions(
     finally:
         con.close()
 
-    seen_ids: set[str] = set()
     sector_counts: dict[str, int] = {k: 0 for k in EXPECTED_SECTOR_COUNTS}
     category_counts: dict[str, int] = {k: 0 for k in EXPECTED_CATEGORY_COUNTS}
     difficulty_counts: dict[str, int] = {k: 0 for k in EXPECTED_DIFFICULTY_COUNTS}
     pair_counts: dict[tuple[str, int], int] = {}
     text_cache: dict[str, str] = {}
 
-    for idx, q in enumerate(questions, start=1):
-        # Mandatory fields
-        qid = q.get("question_id")
-        if not qid or not isinstance(qid, str):
-            raise ValueError(f"Question #{idx} missing valid 'question_id'")
-        if qid in seen_ids:
-            raise ValueError(f"Duplicate question_id '{qid}' at #{idx}")
-        seen_ids.add(qid)
-
-        query = q.get("query")
-        if not query or not isinstance(query, str) or not query.strip():
-            raise ValueError(f"Question {qid} has empty query")
-
-        ticker = q.get("ticker")
+    for q in questions:
+        qid = q["question_id"]
+        query = q["query"]
+        ticker = q["ticker"]
         if ticker not in COMPANY_TO_SECTOR:
             raise ValueError(f"Question {qid} has invalid/unsupported ticker {ticker!r}")
 
-        year = q.get("fiscal_year")
+        year = q["fiscal_year"]
         if year not in (2023, 2024, 2025):
             raise ValueError(f"Question {qid} has invalid fiscal_year {year!r}")
 
-        sector = q.get("sector")
+        sector = q["sector"]
         expected_sector = COMPANY_TO_SECTOR[ticker]
         if sector != expected_sector:
             raise ValueError(
                 f"Question {qid} sector mismatch: ticker {ticker} is in {expected_sector}, got {sector!r}"
             )
 
-        cat_raw = q.get("category")
-        if not cat_raw or not isinstance(cat_raw, str):
-            raise ValueError(f"Question {qid} missing 'category'")
+        cat_raw = q["category"]
         cat = _normalize_category(cat_raw)
         if cat not in VALID_CATEGORIES:
             raise ValueError(f"Question {qid} has invalid category {cat_raw!r}")
 
-        diff = q.get("difficulty")
-        if not diff or not isinstance(diff, str):
-            raise ValueError(f"Question {qid} missing mandatory 'difficulty' field")
+        diff = q["difficulty"]
         diff_lower = diff.strip().lower()
         if diff_lower not in VALID_DIFFICULTIES:
             raise ValueError(f"Question {qid} has invalid difficulty {diff!r} (must be easy, medium, or hard)")
 
-        corpus_hash = q.get("corpus_sha256")
+        corpus_hash = q["corpus_sha256"]
         if corpus_hash != actual_corpus_sha256:
             raise ValueError(
                 f"Question {qid} corpus_sha256 '{corpus_hash}' does not match actual '{actual_corpus_sha256}'"
             )
 
-        gold_ids = q.get("gold_chunk_ids")
-        if not gold_ids or not isinstance(gold_ids, list):
-            raise ValueError(f"Question {qid} missing or empty 'gold_chunk_ids'")
-
-        excerpt = q.get("evidence_excerpt")
-        if not excerpt or not isinstance(excerpt, str) or not excerpt.strip():
-            raise ValueError(f"Question {qid} missing or empty 'evidence_excerpt'")
+        gold_ids = q["gold_chunk_ids"]
+        excerpt = q["evidence_excerpt"]
 
         # Validate each gold chunk ID against DB
         for gid in gold_ids:
@@ -222,19 +268,19 @@ def validate_questions(
                 raise ValueError(
                     f"Question {qid} specifies year {year}, but gold chunk {gid} belongs to {chunk['fiscal_year']}"
                 )
-            if q.get("accession") and q["accession"] != chunk["accession"]:
+            if q["accession"] != chunk["accession"]:
                 raise ValueError(
                     f"Question {qid} accession '{q['accession']}' != chunk '{chunk['accession']}'"
                 )
-            if q.get("source_url") and q["source_url"] != chunk["source_url"]:
+            if q["source_url"] != chunk["source_url"]:
                 raise ValueError(
                     f"Question {qid} source_url '{q['source_url']}' != chunk '{chunk['source_url']}'"
                 )
-            if q.get("section") and q["section"] != chunk["section"]:
+            if q["section"] != chunk["section"]:
                 raise ValueError(
                     f"Question {qid} section '{q['section']}' != chunk '{chunk['section']}'"
                 )
-            if q.get("chunk_type") and q["chunk_type"] != chunk["chunk_type"]:
+            if q["chunk_type"] != chunk["chunk_type"]:
                 raise ValueError(
                     f"Question {qid} chunk_type '{q['chunk_type']}' != chunk '{chunk['chunk_type']}'"
                 )
@@ -245,21 +291,30 @@ def validate_questions(
                     f"Question {qid} evidence_excerpt not found in gold chunk {gid} text"
                 )
 
-            # Check character offsets against canonical text file if text_dir or path provided
-            c_path_str = chunk.get("canonical_text_path")
-            if c_path_str:
+            # Check character offsets against canonical text file
+            if check_canonical_text:
+                c_path_str = chunk.get("canonical_text_path")
+                if not c_path_str:
+                    raise ValueError(f"Question {qid} chunk {gid} missing canonical_text_path")
                 txt_path = Path(c_path_str)
                 if not txt_path.is_file() and text_dir:
                     txt_path = Path(text_dir) / txt_path.name
-                if txt_path.is_file():
-                    if str(txt_path) not in text_cache:
-                        text_cache[str(txt_path)] = txt_path.read_text(encoding="utf-8")
-                    full_text = text_cache[str(txt_path)]
-                    start, end = chunk["char_start"], chunk["char_end"]
-                    if full_text[start:end] != chunk["text"]:
-                        raise ValueError(
-                            f"Question {qid} chunk {gid} char offsets do not match canonical text"
-                        )
+                if not txt_path.is_file() and chunks_file.parent:
+                    candidate = chunks_file.parent / c_path_str
+                    if candidate.is_file():
+                        txt_path = candidate
+                if not txt_path.is_file():
+                    raise FileNotFoundError(
+                        f"Canonical text file not found for Question {qid} chunk {gid}: {txt_path}"
+                    )
+                if str(txt_path) not in text_cache:
+                    text_cache[str(txt_path)] = txt_path.read_text(encoding="utf-8")
+                full_text = text_cache[str(txt_path)]
+                start, end = chunk["char_start"], chunk["char_end"]
+                if full_text[start:end] != chunk["text"]:
+                    raise ValueError(
+                        f"Question {qid} chunk {gid} char offsets do not match canonical text"
+                    )
 
         # Track distributions
         sector_counts[sector] = sector_counts.get(sector, 0) + 1
@@ -294,6 +349,90 @@ def validate_questions(
         "sector_counts": sector_counts,
         "category_counts": category_counts,
         "difficulty_counts": difficulty_counts,
+    }
+
+
+def validate_audit(
+    audit_records: list[dict[str, Any]],
+    questions: list[dict[str, Any]],
+    enforce_100: bool = True,
+) -> dict[str, Any]:
+    """Validate local audit records against audited question dataset."""
+    if not audit_records:
+        raise ValueError("Audit records list is empty.")
+
+    if enforce_100 and len(audit_records) != 100:
+        raise ValueError(f"Expected exactly 100 audit records, got {len(audit_records)}")
+    if enforce_100 and len(questions) != 100:
+        raise ValueError(f"Expected exactly 100 questions, got {len(questions)}")
+
+    q_map = {q["question_id"]: q for q in questions}
+    seen_ids: set[str] = set()
+    decision_counts: dict[str, int] = {}
+
+    for idx, rec in enumerate(audit_records, start=1):
+        qid = rec.get("question_id")
+        if not qid or not isinstance(qid, str):
+            raise ValueError(f"Audit record #{idx} missing valid 'question_id'")
+        if qid in seen_ids:
+            raise ValueError(f"Duplicate question_id '{qid}' in audit records")
+        seen_ids.add(qid)
+
+        if qid not in q_map:
+            raise ValueError(f"Audit record '{qid}' does not match any question in dataset")
+
+        q = q_map[qid]
+        decision = rec.get("decision")
+        if decision not in ALLOWED_AUDIT_DECISIONS:
+            raise ValueError(f"Audit record '{qid}' has invalid decision {decision!r}")
+        if decision == "unresolved":
+            raise ValueError(
+                f"Audit record '{qid}' is marked 'unresolved'; audit cannot be accepted with unresolved records"
+            )
+
+        decision_counts[decision] = decision_counts.get(decision, 0) + 1
+
+        evidence_support = rec.get("evidence_support")
+        if not evidence_support or not isinstance(evidence_support, str) or not evidence_support.strip():
+            raise ValueError(f"Audit record '{qid}' missing required 'evidence_support' explanation")
+
+        verified_excerpt = rec.get("verified_evidence_excerpt")
+        if not verified_excerpt or not isinstance(verified_excerpt, str) or not verified_excerpt.strip():
+            raise ValueError(f"Audit record '{qid}' missing 'verified_evidence_excerpt'")
+
+        # If gold label was changed, require correction reason
+        gold_changed = rec.get("gold_label_changed", False)
+        if (gold_changed or decision == "corrected_gold") and not rec.get("correction_reason"):
+            raise ValueError(f"Audit record '{qid}' has corrected gold label but missing 'correction_reason'")
+
+        # If question was changed, require correction reason
+        q_changed = rec.get("question_changed", False)
+        if (q_changed or decision == "corrected_question") and not rec.get("correction_reason"):
+            raise ValueError(f"Audit record '{qid}' has corrected question but missing 'correction_reason'")
+
+        # Final gold chunk IDs must match question
+        final_golds = rec.get("final_gold_chunk_ids")
+        if final_golds != q.get("gold_chunk_ids"):
+            raise ValueError(
+                f"Audit record '{qid}' final_gold_chunk_ids {final_golds} does not match question gold_chunk_ids {q.get('gold_chunk_ids')}"
+            )
+
+        # Final difficulty must match question
+        final_diff = rec.get("final_difficulty")
+        if final_diff != q.get("difficulty"):
+            raise ValueError(
+                f"Audit record '{qid}' final_difficulty {final_diff!r} does not match question difficulty {q.get('difficulty')!r}"
+            )
+
+    # Check that every question in dataset has an audit entry
+    for qid in q_map:
+        if qid not in seen_ids:
+            raise ValueError(f"Question '{qid}' is missing an audit record")
+
+    return {
+        "status": "valid",
+        "audit_record_count": len(audit_records),
+        "decisions": decision_counts,
     }
 
 
@@ -406,14 +545,14 @@ def evaluate_retrieval(
         per_question_results.append(q_res)
 
         if hit == 0.0:
-            # Diagnose failure type
-            observed_type = "Lexical mismatch"
+            # Diagnose heuristic category
+            heuristic_type = "Lexical mismatch"
             if cat == "financial_tables":
-                observed_type = "Table-heavy content"
+                heuristic_type = "Table-heavy content"
             elif any("Item 15" in sec for sec in retrieved_sections):
-                observed_type = "Section mismatch / Exhibit schedule"
+                heuristic_type = "Section mismatch / Exhibit schedule"
             elif not retrieved_ids:
-                observed_type = "No matches returned"
+                heuristic_type = "No matches returned"
 
             failures.append({
                 "question_id": qid,
@@ -429,7 +568,8 @@ def evaluate_retrieval(
                 "retrieved_sections": retrieved_sections,
                 "evidence_excerpt": q.get("evidence_excerpt", ""),
                 "source_url": q.get("source_url", ""),
-                "observed_failure_type": observed_type,
+                "observed_failure_type": "unreviewed",
+                "heuristic_failure_mode": heuristic_type,
             })
 
     total_q = len(per_question_results)
@@ -519,6 +659,11 @@ def main() -> None:
         default="data/processed/text",
         help="Path to canonical text directory",
     )
+    val_parser.add_argument(
+        "--audit-path",
+        default=None,
+        help="Optional path to local audit JSONL file (e.g. data/processed/retrieval_dev_audit.jsonl)",
+    )
 
     # Subcommand: run
     run_parser = subparsers.add_parser("run", help="Run retrieval evaluation.")
@@ -544,6 +689,11 @@ def main() -> None:
         help="Path to chunks.jsonl",
     )
     run_parser.add_argument(
+        "--text-dir",
+        default="data/processed/text",
+        help="Path to canonical text directory",
+    )
+    run_parser.add_argument(
         "--output",
         default="data/processed/retrieval_dev_results.json",
         help="Path to output results file",
@@ -558,7 +708,8 @@ def main() -> None:
             db_path=args.db_path,
             chunks_path=args.chunks_path,
             text_dir=args.text_dir,
-            enforce_100_dist=(len(questions) == 100),
+            enforce_100_dist=True,
+            check_canonical_text=True,
         )
         print(f"Validation SUCCESS: {val_summary['question_count']} questions verified.")
         print(f"Corpus SHA-256: {val_summary['corpus_sha256']}")
@@ -566,13 +717,25 @@ def main() -> None:
         print(f"Category counts: {val_summary['category_counts']}")
         print(f"Difficulty counts: {val_summary['difficulty_counts']}")
 
+        if args.audit_path:
+            audit_records = load_audit(args.audit_path)
+            audit_summary = validate_audit(
+                audit_records=audit_records,
+                questions=questions,
+                enforce_100=True,
+            )
+            print(f"Audit validation SUCCESS: {audit_summary['audit_record_count']} audit records verified.")
+            print(f"Audit decisions: {audit_summary['decisions']}")
+
     elif args.command == "run":
         questions = load_questions(args.questions)
         validate_questions(
             questions=questions,
             db_path=args.db_path,
             chunks_path=args.chunks_path,
-            enforce_100_dist=(len(questions) == 100),
+            text_dir=args.text_dir,
+            enforce_100_dist=True,
+            check_canonical_text=True,
         )
         results = evaluate_retrieval(
             questions=questions,
