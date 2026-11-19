@@ -1095,3 +1095,69 @@ def test_network_guard_blocks_real_http_calls():
     s = requests.Session()
     with pytest.raises(RuntimeError, match="Unexpected real network request attempted during offline tests"):
         s.get("https://www.sec.gov")
+
+
+def test_failed_refresh_rejects_stored_fact_with_mismatched_accession(tmp_path):
+    raw_dir = tmp_path / "raw"
+    processed_dir = tmp_path / "processed"
+    raw_dir.mkdir(parents=True)
+    processed_dir.mkdir(parents=True)
+
+    filings_dir = raw_dir / "filings"
+    filings_dir.mkdir(parents=True)
+    html_content = b"<!DOCTYPE html><html><body>MSFT 10K content " + b"M" * 1500 + b"</body></html>"
+    msft_file = filings_dir / "MSFT_2024_000095017024087843.html"
+    msft_file.write_bytes(html_content)
+    file_sha = hashlib.sha256(html_content).hexdigest()
+
+    manifest_data = {
+        "company_identities": [
+            {"ticker": "MSFT", "cik": "0000789019", "name": "Microsoft Corp", "sector": "Technology"},
+        ],
+        "filings": [
+            {
+                "ticker": "MSFT",
+                "fiscal_year": 2024,
+                "status": "downloaded",
+                "accession": "0000950170-24-087843",
+                "form": "10-K",
+                "local_path": str(msft_file.as_posix()),
+                "file_sha256": file_sha,
+                "selected_metrics": ["assets"],
+                "unavailable_metrics": {},
+                "errors": [],
+            }
+        ],
+    }
+    (processed_dir / "manifest.json").write_text(json.dumps(manifest_data), encoding="utf-8")
+
+    # Stored fact with mismatched accession (e.g. from an amendment or prior filing)
+    mismatched_fact = {
+        "ticker": "MSFT",
+        "cik": "0000789019",
+        "company_name": "Microsoft Corp",
+        "sector": "Technology",
+        "fiscal_year": 2024,
+        "metric": "assets",
+        "taxonomy": "us-gaap",
+        "tag": "Assets",
+        "value": 512163000000,
+        "unit": "USD",
+        "form": "10-K",
+        "accession": "0000950170-24-999999",  # Mismatched accession!
+    }
+    (processed_dir / "facts.jsonl").write_text(json.dumps(mismatched_fact) + "\n", encoding="utf-8")
+
+    mock_session = MagicMock()
+    mock_resp = MagicMock()
+    mock_resp.status_code = 403
+    mock_session.get.return_value = mock_resp
+
+    res = collect_data(tickers=["MSFT"], years=[2024], cache_dir=raw_dir, session=mock_session)
+    curr = res["summary"]["current_run"]
+
+    assert curr["failed_filings"] == 1
+    # Because stored fact accession did not match filing accession, facts are not preserved
+    with (processed_dir / "facts.jsonl").open("r", encoding="utf-8") as f:
+        stored = [json.loads(line) for line in f if line.strip()]
+    assert len(stored) == 0

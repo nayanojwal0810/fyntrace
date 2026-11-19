@@ -884,10 +884,17 @@ def _is_filing_record_valid(
         return False
 
     if facts:
+        filing_accn = filing.get("accession")
         for f in facts:
             if not isinstance(f, dict):
                 return False
             if f.get("ticker") != filing.get("ticker") or f.get("fiscal_year") != filing.get("fiscal_year"):
+                return False
+            fact_accn = f.get("accession")
+            if not fact_accn or not filing_accn or fact_accn != filing_accn:
+                return False
+            form = f.get("form")
+            if form is not None and form != "10-K":
                 return False
     return True
 
