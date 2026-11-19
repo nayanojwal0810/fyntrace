@@ -2,6 +2,7 @@
 
 import argparse
 from datetime import datetime
+from decimal import Decimal
 import json
 import os
 import re
@@ -9,6 +10,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 import requests
@@ -192,6 +194,18 @@ def make_sec_session(user_agent: str | None = None, env_path: Path | None = None
 
 def sec_get_json(url: str, session: requests.Session | None = None) -> dict:
     """Fetch JSON from a trusted SEC URL, handling errors and rate limits."""
+    if not isinstance(url, str) or not url.strip():
+        raise ValueError("SEC URL must not be empty.")
+
+    parsed = urlparse(url.strip())
+    if parsed.scheme.lower() != "https":
+        raise ValueError(f"Insecure or invalid URL scheme '{parsed.scheme}'. SEC requests must use HTTPS.")
+    allowed_hosts = ("www.sec.gov", "data.sec.gov", "sec.gov")
+    if parsed.netloc.lower() not in allowed_hosts:
+        raise ValueError(f"Untrusted SEC host '{parsed.netloc}'. Must be one of {allowed_hosts}.")
+    if ".." in parsed.path:
+        raise ValueError(f"Unsafe URL path with traversal components: '{parsed.path}'.")
+
     if session is None:
         session = make_sec_session()
 
@@ -393,9 +407,11 @@ def get_submissions(
         if cache_file.is_file():
             try:
                 with open(cache_file, "r", encoding="utf-8") as f:
-                    return json.load(f)
+                    cached_data = json.load(f)
+                validate_submissions_response(cached_data, cik_norm)
+                return cached_data
             except Exception as exc:
-                raise ValueError(f"Failed to read cached submissions file {cache_file}: {exc}") from exc
+                raise ValueError(f"Failed to read or validate cached submissions file {cache_file}: {exc}") from exc
 
     if session is None:
         session = make_sec_session()
@@ -422,9 +438,11 @@ def get_companyfacts(
         if cache_file.is_file():
             try:
                 with open(cache_file, "r", encoding="utf-8") as f:
-                    return json.load(f)
+                    cached_data = json.load(f)
+                validate_companyfacts_response(cached_data, cik_norm)
+                return cached_data
             except Exception as exc:
-                raise ValueError(f"Failed to read cached companyfacts file {cache_file}: {exc}") from exc
+                raise ValueError(f"Failed to read or validate cached companyfacts file {cache_file}: {exc}") from exc
 
     if session is None:
         session = make_sec_session()
@@ -438,10 +456,21 @@ def get_companyfacts(
 
 def filing_url(cik: str | int, accession: str, primary_document: str) -> str:
     """Construct official SEC archive URL for a filing document."""
-    cik_number = str(int(cik))
-    accession_compact = accession.replace("-", "")
-    doc_basename = Path(primary_document).name
-    return f"https://www.sec.gov/Archives/edgar/data/{cik_number}/{accession_compact}/{doc_basename}"
+    cik_norm = normalize_cik(cik)
+    cik_number = str(int(cik_norm))
+    if not isinstance(accession, str) or not re.match(r"^\d{10}-\d{2}-\d{6}$", accession.strip()):
+        raise ValueError(f"Invalid accession number format: '{accession}'. Must match 0000000000-00-000000.")
+    accn_clean = accession.strip()
+    accession_compact = accn_clean.replace("-", "")
+
+    if not isinstance(primary_document, str) or not primary_document.strip():
+        raise ValueError("primary_document must be a non-empty string.")
+    doc_clean = primary_document.strip()
+    if "/" in doc_clean or "\\" in doc_clean or ".." in doc_clean or not re.match(r"^[a-zA-Z0-9_\-\.]+$", doc_clean):
+        raise ValueError(
+            f"Invalid primary document name '{primary_document}'. Must be a safe filename without path separators or traversal."
+        )
+    return f"https://www.sec.gov/Archives/edgar/data/{cik_number}/{accession_compact}/{doc_clean}"
 
 
 def list_filings(
@@ -809,15 +838,20 @@ def collect_panel_data(
 
 
 def load_filing_manifest(manifest_path: Path | None = None) -> list[dict[str, Any]]:
-    """Load and validate the filing manifest from disk.
+    """Load and strictly validate the filing manifest from disk.
 
     Validates:
     - Exactly 90 records.
-    - Exactly 30 unique companies.
+    - Exactly 30 unique companies matching COMPANY_PANEL.
     - Three target fiscal years per company: 2023, 2024, 2025.
     - No duplicate company-year combinations.
-    - Every selected filing has a valid accession number, CIK, filing date, and report date.
+    - Form is Form 10-K (no amendments or quarterly filings).
     - All records have 'confirmed' status.
+    - Valid 10-digit CIK (including XOM historical CIK 0000034088).
+    - Valid accession number format (0000000000-00-000000).
+    - Valid dates, and filing date <= collection cutoff.
+    - Primary document is a safe basename.
+    - Source URL matches official filing_url.
     """
     path = Path(manifest_path) if manifest_path is not None else (PROCESSED_DATA_DIR / "filing_manifest.json")
     if not path.is_file():
@@ -845,25 +879,57 @@ def load_filing_manifest(manifest_path: Path | None = None) -> list[dict[str, An
         ticker = rec.get("ticker")
         fy = rec.get("target_fiscal_year")
         status = rec.get("fiscal_year_status")
+        form = rec.get("form")
         accn = rec.get("accession_number")
         cik = rec.get("cik")
         filing_date = rec.get("filing_date")
         report_date = rec.get("report_date")
+        primary_doc = rec.get("primary_document")
+        source_url = rec.get("source_url")
 
-        if not ticker or not isinstance(ticker, str):
-            raise ValueError("Manifest record missing valid 'ticker'.")
-        if not isinstance(fy, int):
-            raise ValueError(f"Manifest record for '{ticker}' missing valid integer 'target_fiscal_year'.")
+        if not ticker or not isinstance(ticker, str) or ticker not in PANEL_TICKERS:
+            raise ValueError(f"Manifest record has missing or unsupported ticker: {ticker!r}")
+        if not isinstance(fy, int) or isinstance(fy, bool) or fy not in TARGET_FISCAL_YEARS:
+            raise ValueError(f"Manifest record for '{ticker}' missing or invalid target_fiscal_year: {fy!r}")
         if status != "confirmed":
             raise ValueError(f"Manifest record for '{ticker}' FY{fy} status is '{status}', expected 'confirmed'.")
-        if not accn or not isinstance(accn, str):
-            raise ValueError(f"Manifest record for '{ticker}' FY{fy} missing valid 'accession_number'.")
+        if form != "10-K":
+            raise ValueError(f"Manifest record for '{ticker}' FY{fy} has form '{form}', expected '10-K'.")
+        if not accn or not isinstance(accn, str) or not re.match(r"^\d{10}-\d{2}-\d{6}$", accn):
+            raise ValueError(f"Manifest record for '{ticker}' FY{fy} has invalid accession format: {accn!r}")
         if not cik:
             raise ValueError(f"Manifest record for '{ticker}' FY{fy} missing valid 'cik'.")
-        if not filing_date or not isinstance(filing_date, str):
-            raise ValueError(f"Manifest record for '{ticker}' FY{fy} missing valid 'filing_date'.")
-        if not report_date or not isinstance(report_date, str):
-            raise ValueError(f"Manifest record for '{ticker}' FY{fy} missing valid 'report_date'.")
+        cik_norm = normalize_cik(cik)
+        if ticker == "XOM" and cik_norm != HISTORICAL_PANEL_REGISTRANTS["XOM"]["cik"]:
+            raise ValueError(
+                f"XOM manifest record must use historical CIK {HISTORICAL_PANEL_REGISTRANTS['XOM']['cik']}, got {cik_norm}"
+            )
+
+        if not filing_date or not isinstance(filing_date, str) or not re.match(r"^\d{4}-\d{2}-\d{2}$", filing_date):
+            raise ValueError(f"Manifest record for '{ticker}' FY{fy} missing or invalid filing_date: {filing_date!r}")
+        if filing_date > COLLECTION_CUTOFF_DATE:
+            raise ValueError(
+                f"Manifest record for '{ticker}' FY{fy} filing date {filing_date} is after cutoff {COLLECTION_CUTOFF_DATE}."
+            )
+
+        if not report_date or not isinstance(report_date, str) or not re.match(r"^\d{4}-\d{2}-\d{2}$", report_date):
+            raise ValueError(f"Manifest record for '{ticker}' FY{fy} missing or invalid report_date: {report_date!r}")
+
+        if (
+            not primary_doc
+            or not isinstance(primary_doc, str)
+            or "/" in primary_doc
+            or "\\" in primary_doc
+            or ".." in primary_doc
+            or not re.match(r"^[a-zA-Z0-9_\-\.]+$", primary_doc)
+        ):
+            raise ValueError(f"Manifest record for '{ticker}' FY{fy} has invalid primary_document: {primary_doc!r}")
+
+        expected_url = filing_url(cik_norm, accn, primary_doc)
+        if source_url != expected_url:
+            raise ValueError(
+                f"Manifest record for '{ticker}' FY{fy} source_url mismatch: expected '{expected_url}', got '{source_url}'"
+            )
 
         pair = (ticker, fy)
         if pair in seen_company_years:

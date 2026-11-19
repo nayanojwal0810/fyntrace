@@ -404,8 +404,21 @@ def extract_sections(canonical_text: str) -> list[dict[str, Any]]:
             end_pos = subsequent[0] if subsequent else len(canonical_text)
 
         length = end_pos - start_pos
-        # Conservative confidence: require at least 100 characters of substantive body prose
-        if length >= 100:
+        body_text = canonical_text[start_pos:end_pos].strip()
+        lines = [l for l in body_text.splitlines() if l.strip()]
+
+        # Conservative confidence: require substantive body prose beyond the heading
+        first_few_lines = " ".join(lines[:3]).lower() if lines else ""
+        is_cross_ref_stub = (
+            "reference is made to" in first_few_lines
+            or "appears on page" in first_few_lines
+            or "appears on pages" in first_few_lines
+            or "incorporated by reference" in first_few_lines
+            or "stub." in first_few_lines
+        )
+
+        # High confidence requires at least 250 chars of substantive prose and not a short cross-ref stub
+        if length >= 250 and len(lines) >= 2 and not (length < 1000 and is_cross_ref_stub):
             confidence = "high"
             assigned_name = sec_name
         else:

@@ -1,5 +1,6 @@
 """Financial calculations and company comparisons module."""
 
+from decimal import Decimal, ROUND_HALF_UP
 import json
 import math
 from pathlib import Path
@@ -16,6 +17,9 @@ SUPPORTED_METRICS: set[str] = set(FINANCIAL_METRICS.keys())
 
 ALLOWED_STATUSES = {"found", "missing", "ambiguous"}
 REQUIRED_FIELDS = ("ticker", "fiscal_year", "metric", "status", "value", "unit")
+
+# Bank-specific net revenue concepts that are not comparable to commercial gross sales
+BANK_REVENUE_TAGS = frozenset({"RevenuesNetOfInterestExpense"})
 
 RATIO_DEFINITIONS: dict[str, dict[str, str]] = {
     "operating_margin": {
@@ -159,7 +163,11 @@ def calculate_growth(
     end_year: int,
     facts: dict[tuple[str, int, str], dict[str, Any]],
 ) -> dict[str, Any]:
-    """Calculate percentage growth between start_year and end_year for a company metric."""
+    """Calculate percentage growth between start_year and end_year for a company metric.
+
+    Uses decimal.Decimal for precision and ROUND_HALF_UP to four decimal places.
+    Returns JSON-safe exact decimal string for percentage_change.
+    """
     if not isinstance(start_year, int) or isinstance(start_year, bool):
         raise ValueError(f"Invalid start_year: {start_year!r}")
     if not isinstance(end_year, int) or isinstance(end_year, bool):
@@ -207,6 +215,35 @@ def calculate_growth(
             "reason": f"Incompatible units: FY{start_year} ({unit_start}) vs FY{end_year} ({unit_end}).",
         }
 
+    pol_start = start_fact.get("selection_policy")
+    pol_end = end_fact.get("selection_policy")
+    if pol_start != pol_end:
+        return {
+            "status": "unavailable",
+            "ticker": ticker_clean,
+            "metric": metric_clean,
+            "start_year": start_year,
+            "end_year": end_year,
+            "reason": f"Incompatible selection policies: FY{start_year} ('{pol_start}') vs FY{end_year} ('{pol_end}').",
+        }
+
+    # Revenue concept changes between growth years must not be silently compared
+    if metric_clean == "revenue":
+        tag_start = start_fact.get("tag")
+        tag_end = end_fact.get("tag")
+        if tag_start != tag_end:
+            return {
+                "status": "unavailable",
+                "ticker": ticker_clean,
+                "metric": metric_clean,
+                "start_year": start_year,
+                "end_year": end_year,
+                "reason": (
+                    f"Revenue accounting concept changed between FY{start_year} ('{tag_start}') "
+                    f"and FY{end_year} ('{tag_end}'). Growth is unavailable across differing concepts."
+                ),
+            }
+
     old_val = start_fact["value"]
     new_val = end_fact["value"]
 
@@ -221,8 +258,11 @@ def calculate_growth(
         }
 
     formula = "((new_value - old_value) / old_value) * 100"
-    raw_change = ((new_val - old_val) / old_val) * 100.0
-    pct_change = round(raw_change, 4)
+    old_dec = Decimal(str(old_val))
+    new_dec = Decimal(str(new_val))
+    raw_growth = ((new_dec - old_dec) / old_dec) * Decimal("100")
+    pct_dec = raw_growth.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+    pct_change_str = f"{pct_dec:.4f}"
 
     return {
         "status": "success",
@@ -232,9 +272,10 @@ def calculate_growth(
         "end_year": end_year,
         "old_value": old_val,
         "new_value": new_val,
-        "percentage_change": pct_change,
+        "percentage_change": pct_change_str,
         "unit": unit_start,
         "formula": formula,
+        "rounding": "ROUND_HALF_UP to 4 decimal places",
         "start_period_end": start_fact.get("period_end"),
         "end_period_end": end_fact.get("period_end"),
         "sources": [
@@ -258,7 +299,11 @@ def calculate_ratio(
     ratio_name: str,
     facts: dict[tuple[str, int, str], dict[str, Any]],
 ) -> dict[str, Any]:
-    """Calculate a standard financial ratio (operating margin, net profit margin, liabilities-to-assets)."""
+    """Calculate a standard financial ratio (operating margin, net profit margin, liabilities-to-assets).
+
+    Uses decimal.Decimal for precision and ROUND_HALF_UP to four decimal places.
+    Returns JSON-safe exact decimal string for ratio value.
+    """
     if not isinstance(ratio_name, str) or not ratio_name.strip():
         raise ValueError("ratio_name must be a non-empty string.")
 
@@ -306,6 +351,30 @@ def calculate_ratio(
             "reason": f"Incompatible units: '{num_metric}' ({num_fact.get('unit')}) vs '{den_metric}' ({den_fact.get('unit')}).",
         }
 
+    # Different reporting periods in same-year ratios must be rejected
+    num_end = num_fact.get("period_end")
+    den_end = den_fact.get("period_end")
+    if num_end and den_end and num_end != den_end:
+        return {
+            "status": "unavailable",
+            "ticker": ticker_clean,
+            "fiscal_year": fiscal_year,
+            "ratio": ratio_def["display_name"],
+            "reason": f"Reporting period mismatch: '{num_metric}' ended on {num_end}, while '{den_metric}' ended on {den_end}.",
+        }
+
+    # Selection policies must match
+    pol_num = num_fact.get("selection_policy")
+    pol_den = den_fact.get("selection_policy")
+    if pol_num != pol_den:
+        return {
+            "status": "unavailable",
+            "ticker": ticker_clean,
+            "fiscal_year": fiscal_year,
+            "ratio": ratio_def["display_name"],
+            "reason": f"Selection policy mismatch: '{num_metric}' ('{pol_num}') vs '{den_metric}' ('{pol_den}').",
+        }
+
     num_val = num_fact["value"]
     den_val = den_fact["value"]
 
@@ -318,17 +387,21 @@ def calculate_ratio(
             "reason": f"Denominator '{den_metric}' must be greater than zero (got {den_val}).",
         }
 
-    raw_ratio = (num_val / den_val) * 100.0
-    ratio_val = round(raw_ratio, 4)
+    num_dec = Decimal(str(num_val))
+    den_dec = Decimal(str(den_val))
+    raw_ratio = (num_dec / den_dec) * Decimal("100")
+    ratio_dec = raw_ratio.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+    ratio_val_str = f"{ratio_dec:.4f}"
 
     return {
         "status": "success",
         "ticker": ticker_clean,
         "fiscal_year": fiscal_year,
         "ratio": ratio_def["display_name"],
-        "value": ratio_val,
+        "value": ratio_val_str,
         "unit": "percent",
         "formula": ratio_def["formula"],
+        "rounding": "ROUND_HALF_UP to 4 decimal places",
         "numerator": {
             "metric": num_metric,
             "value": num_val,
@@ -369,7 +442,11 @@ def compare_companies(
     metric: str,
     facts: dict[tuple[str, int, str], dict[str, Any]],
 ) -> dict[str, Any]:
-    """Compare a financial metric between two companies for a target fiscal year."""
+    """Compare a financial metric between two companies for a target fiscal year.
+
+    Guarantees bank net revenue is not treated as equivalent to commercial gross sales.
+    Calculates differences with exact integer USD precision.
+    """
     fact_a = get_fact(ticker_a, fiscal_year, metric, facts)
     fact_b = get_fact(ticker_b, fiscal_year, metric, facts)
 
@@ -413,18 +490,67 @@ def compare_companies(
 
     val_a = fact_a["value"]
     val_b = fact_b["value"]
-    diff = val_a - val_b
-
-    notes: list[str] = []
     end_a = fact_a.get("period_end")
     end_b = fact_b.get("period_end")
+    tag_a = fact_a.get("tag")
+    tag_b = fact_b.get("tag")
+
+    # Semantic revenue comparability check: bank net revenue vs commercial revenue
+    if m_clean == "revenue":
+        is_bank_a = tag_a in BANK_REVENUE_TAGS
+        is_bank_b = tag_b in BANK_REVENUE_TAGS
+        if is_bank_a != is_bank_b:
+            return {
+                "status": "not_comparable",
+                "fiscal_year": fiscal_year,
+                "metric": m_clean,
+                "unit": unit_a,
+                "reason": (
+                    f"Revenue concepts are materially incompatible: {t_a} reported "
+                    f"{'bank net revenue' if is_bank_a else 'commercial revenue'} ('{tag_a}'), while {t_b} reported "
+                    f"{'bank net revenue' if is_bank_b else 'commercial revenue'} ('{tag_b}'). "
+                    f"Bank net interest revenue cannot be directly compared to commercial sales."
+                ),
+                "company_a": {
+                    "ticker": t_a,
+                    "company_name": fact_a.get("company_name"),
+                    "value": val_a,
+                    "period_end": end_a,
+                    "tag": tag_a,
+                    "accession": fact_a.get("accession"),
+                    "source_url": fact_a.get("source_url"),
+                },
+                "company_b": {
+                    "ticker": t_b,
+                    "company_name": fact_b.get("company_name"),
+                    "value": val_b,
+                    "period_end": end_b,
+                    "tag": tag_b,
+                    "accession": fact_b.get("accession"),
+                    "source_url": fact_b.get("source_url"),
+                },
+                "sources": [
+                    {
+                        "ticker": t_a,
+                        "accession": fact_a.get("accession"),
+                        "source_url": fact_a.get("source_url"),
+                    },
+                    {
+                        "ticker": t_b,
+                        "accession": fact_b.get("accession"),
+                        "source_url": fact_b.get("source_url"),
+                    },
+                ],
+            }
+
+    diff = int(Decimal(str(val_a)) - Decimal(str(val_b)))
+
+    notes: list[str] = []
     if end_a != end_b:
         notes.append(
             f"Reporting periods differ: {t_a} FY{fiscal_year} ended on {end_a}, while {t_b} FY{fiscal_year} ended on {end_b}. These are not identical calendar periods."
         )
 
-    tag_a = fact_a.get("tag")
-    tag_b = fact_b.get("tag")
     if m_clean == "revenue" and tag_a != tag_b:
         notes.append(
             f"Revenue accounting tags differ: {t_a} reported '{tag_a}', while {t_b} reported '{tag_b}'. Concepts may not be perfectly equivalent."
@@ -465,6 +591,100 @@ def compare_companies(
                 "ticker": t_b,
                 "accession": fact_b.get("accession"),
                 "source_url": fact_b.get("source_url"),
+            },
+        ],
+    }
+
+
+def calculate_net_assets(
+    ticker: str,
+    fiscal_year: int,
+    facts: dict[tuple[str, int, str], dict[str, Any]],
+) -> dict[str, Any]:
+    """Calculate Net assets = Assets - Liabilities for a company in a fiscal year.
+
+    Requires both facts to be found, with identical unit, period_end, and selection policy.
+    Returns unavailable if either fact is missing (e.g. companies not reporting separate liabilities).
+    """
+    assets_fact = get_fact(ticker, fiscal_year, "assets", facts)
+    liabilities_fact = get_fact(ticker, fiscal_year, "liabilities", facts)
+
+    ticker_clean = ticker.strip().upper() if isinstance(ticker, str) else ticker
+
+    if assets_fact.get("status") != "found":
+        reason = assets_fact.get("reason") or f"status is {assets_fact.get('status')}"
+        return {
+            "status": "unavailable",
+            "ticker": ticker_clean,
+            "fiscal_year": fiscal_year,
+            "reason": f"Assets data unavailable: {reason}",
+        }
+
+    if liabilities_fact.get("status") != "found":
+        reason = liabilities_fact.get("reason") or f"status is {liabilities_fact.get('status')}"
+        return {
+            "status": "unavailable",
+            "ticker": ticker_clean,
+            "fiscal_year": fiscal_year,
+            "reason": f"Liabilities data unavailable: {reason}",
+        }
+
+    unit_a = assets_fact.get("unit")
+    unit_l = liabilities_fact.get("unit")
+    if unit_a != unit_l:
+        return {
+            "status": "unavailable",
+            "ticker": ticker_clean,
+            "fiscal_year": fiscal_year,
+            "reason": f"Incompatible units: assets ({unit_a}) vs liabilities ({unit_l}).",
+        }
+
+    end_a = assets_fact.get("period_end")
+    end_l = liabilities_fact.get("period_end")
+    if end_a != end_l:
+        return {
+            "status": "unavailable",
+            "ticker": ticker_clean,
+            "fiscal_year": fiscal_year,
+            "reason": f"Reporting period mismatch: assets ended on {end_a}, while liabilities ended on {end_l}.",
+        }
+
+    pol_a = assets_fact.get("selection_policy")
+    pol_l = liabilities_fact.get("selection_policy")
+    if pol_a != pol_l:
+        return {
+            "status": "unavailable",
+            "ticker": ticker_clean,
+            "fiscal_year": fiscal_year,
+            "reason": f"Selection policy mismatch: assets ('{pol_a}') vs liabilities ('{pol_l}').",
+        }
+
+    val_a = assets_fact["value"]
+    val_l = liabilities_fact["value"]
+    net_assets = int(Decimal(str(val_a)) - Decimal(str(val_l)))
+
+    return {
+        "status": "success",
+        "ticker": ticker_clean,
+        "fiscal_year": fiscal_year,
+        "value": net_assets,
+        "unit": unit_a,
+        "formula": "assets - liabilities",
+        "period_end": end_a,
+        "inputs": {
+            "assets": val_a,
+            "liabilities": val_l,
+        },
+        "sources": [
+            {
+                "metric": "assets",
+                "accession": assets_fact.get("accession"),
+                "source_url": assets_fact.get("source_url"),
+            },
+            {
+                "metric": "liabilities",
+                "accession": liabilities_fact.get("accession"),
+                "source_url": liabilities_fact.get("source_url"),
             },
         ],
     }

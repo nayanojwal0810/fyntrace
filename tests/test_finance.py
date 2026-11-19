@@ -8,6 +8,7 @@ import pytest
 
 from src.finance import (
     calculate_growth,
+    calculate_net_assets,
     calculate_ratio,
     compare_companies,
     get_fact,
@@ -180,7 +181,7 @@ def test_6_revenue_growth_calculation() -> None:
     assert res["status"] == "success"
     assert res["old_value"] == 200000
     assert res["new_value"] == 250000
-    assert res["percentage_change"] == 25.0
+    assert res["percentage_change"] == "25.0000"
     assert res["formula"] == "((new_value - old_value) / old_value) * 100"
     assert len(res["sources"]) == 2
     assert res["sources"][0]["year"] == 2023
@@ -218,12 +219,12 @@ def test_8_operating_and_net_profit_margins() -> None:
 
     op_res = calculate_ratio("MSFT", 2024, "operating_margin", facts)
     assert op_res["status"] == "success"
-    assert op_res["value"] == 25.0
+    assert op_res["value"] == "25.0000"
     assert op_res["ratio"] == "Operating margin"
 
     net_res = calculate_ratio("MSFT", 2024, "net_profit_margin", facts)
     assert net_res["status"] == "success"
-    assert net_res["value"] == 20.0
+    assert net_res["value"] == "20.0000"
     assert net_res["ratio"] == "Net profit margin"
 
     # Negative net income (net loss) allowed in margins
@@ -231,7 +232,7 @@ def test_8_operating_and_net_profit_margins() -> None:
     facts_loss[("MSFT", 2024, "net_income")] = make_fact_row(metric="net_income", value=-20000)
     loss_res = calculate_ratio("MSFT", 2024, "net_profit_margin", facts_loss)
     assert loss_res["status"] == "success"
-    assert loss_res["value"] == -10.0
+    assert loss_res["value"] == "-10.0000"
 
 
 def test_9_liabilities_to_assets_calculation() -> None:
@@ -243,7 +244,7 @@ def test_9_liabilities_to_assets_calculation() -> None:
 
     res = calculate_ratio("MSFT", 2024, "liabilities-to-assets", facts)
     assert res["status"] == "success"
-    assert res["value"] == 60.0
+    assert res["value"] == "60.0000"
     assert res["ratio"] == "Liabilities-to-assets"
     assert res["numerator"]["value"] == 60000
     assert res["denominator"]["value"] == 100000
@@ -342,3 +343,145 @@ def test_14_unsupported_companies_years_and_metrics() -> None:
     with pytest.raises(ValueError) as exc4:
         calculate_ratio("MSFT", 2024, "return_on_equity", facts)
     assert "Unsupported ratio" in str(exc4.value)
+
+
+def test_15_decimal_precision_with_large_usd_numbers() -> None:
+    """1. Decimal precision with large USD numbers preserves exact integer precision without float drift."""
+    # 512,163,000,000 to 563,379,300,000 (growth: exactly 10.0000%)
+    f23 = make_fact_row(ticker="MSFT", fy=2023, metric="assets", value=512163000000)
+    f24 = make_fact_row(ticker="MSFT", fy=2024, metric="assets", value=563379300000)
+    facts = {("MSFT", 2023, "assets"): f23, ("MSFT", 2024, "assets"): f24}
+
+    res = calculate_growth("MSFT", "assets", 2023, 2024, facts)
+    assert res["status"] == "success"
+    assert res["percentage_change"] == "10.0000"
+
+
+def test_16_growth_100_to_125_and_100_to_80() -> None:
+    """2 & 3. 100 to 125 growth equals 25.0000%; 100 to 80 growth equals -20.0000%."""
+    f100 = make_fact_row(ticker="MSFT", fy=2023, metric="revenue", value=100)
+    f125 = make_fact_row(ticker="MSFT", fy=2024, metric="revenue", value=125)
+    f80 = make_fact_row(ticker="MSFT", fy=2024, metric="revenue", value=80)
+
+    res_pos = calculate_growth("MSFT", "revenue", 2023, 2024, {("MSFT", 2023, "revenue"): f100, ("MSFT", 2024, "revenue"): f125})
+    assert res_pos["status"] == "success"
+    assert res_pos["percentage_change"] == "25.0000"
+
+    res_neg = calculate_growth("MSFT", "revenue", 2023, 2024, {("MSFT", 2023, "revenue"): f100, ("MSFT", 2024, "revenue"): f80})
+    assert res_neg["status"] == "success"
+    assert res_neg["percentage_change"] == "-20.0000"
+
+
+def test_17_nonterminating_decimal_ratio_and_rounding() -> None:
+    """4. Nonterminating decimal ratio rounds using ROUND_HALF_UP to 4 decimal places."""
+    # 1 / 3 = 33.333333... -> 33.3333%
+    facts = {
+        ("MSFT", 2024, "net_income"): make_fact_row(metric="net_income", value=1),
+        ("MSFT", 2024, "revenue"): make_fact_row(metric="revenue", value=3),
+    }
+    res = calculate_ratio("MSFT", 2024, "net_profit_margin", facts)
+    assert res["status"] == "success"
+    assert res["value"] == "33.3333"
+
+    # 2 / 3 = 66.666666... -> 66.6667%
+    facts_2 = {
+        ("MSFT", 2024, "net_income"): make_fact_row(metric="net_income", value=2),
+        ("MSFT", 2024, "revenue"): make_fact_row(metric="revenue", value=3),
+    }
+    res_2 = calculate_ratio("MSFT", 2024, "net_profit_margin", facts_2)
+    assert res_2["status"] == "success"
+    assert res_2["value"] == "66.6667"
+
+
+def test_18_mismatched_reporting_periods_in_ratios() -> None:
+    """9. Mismatched annual reporting periods within the same year return unavailable."""
+    facts = {
+        ("MSFT", 2024, "net_income"): make_fact_row(metric="net_income", value=40000, end="2024-06-30"),
+        ("MSFT", 2024, "revenue"): make_fact_row(metric="revenue", value=200000, end="2024-07-31"),
+    }
+    res = calculate_ratio("MSFT", 2024, "net_profit_margin", facts)
+    assert res["status"] == "unavailable"
+    assert "Reporting period mismatch" in res["reason"]
+
+
+def test_19_incompatible_revenue_concepts_in_growth() -> None:
+    """10. Revenue concept tag changes between growth years return unavailable."""
+    f23 = make_fact_row(ticker="WMT", fy=2023, metric="revenue", value=600000, tag="Revenues")
+    f24 = make_fact_row(ticker="WMT", fy=2024, metric="revenue", value=650000, tag="SalesRevenueNet")
+    facts = {("WMT", 2023, "revenue"): f23, ("WMT", 2024, "revenue"): f24}
+
+    res = calculate_growth("WMT", "revenue", 2023, 2024, facts)
+    assert res["status"] == "unavailable"
+    assert "concept changed" in res["reason"]
+
+
+def test_20_bank_versus_industrial_revenue_comparison() -> None:
+    """11. Bank net interest revenue compared to commercial sales returns not_comparable."""
+    facts = {
+        ("JPM", 2024, "revenue"): make_fact_row(
+            ticker="JPM",
+            company_name="JPMORGAN CHASE & CO",
+            tag="RevenuesNetOfInterestExpense",
+            value=160000000000,
+        ),
+        ("MSFT", 2024, "revenue"): make_fact_row(
+            ticker="MSFT",
+            company_name="MICROSOFT CORP",
+            tag="RevenueFromContractWithCustomerExcludingAssessedTax",
+            value=245000000000,
+        ),
+    }
+    res = compare_companies("JPM", "MSFT", 2024, "revenue", facts)
+    assert res["status"] == "not_comparable"
+    assert "materially incompatible" in res["reason"]
+    assert res["company_a"]["ticker"] == "JPM"
+    assert res["company_b"]["ticker"] == "MSFT"
+    assert len(res["sources"]) == 2
+
+
+def test_21_valid_net_assets_calculation() -> None:
+    """13. Valid net assets = assets - liabilities with integer precision and complete sourcing."""
+    facts = {
+        ("MSFT", 2024, "assets"): make_fact_row(ticker="MSFT", metric="assets", value=512163000000),
+        ("MSFT", 2024, "liabilities"): make_fact_row(ticker="MSFT", metric="liabilities", value=243686000000),
+    }
+    res = calculate_net_assets("MSFT", 2024, facts)
+    assert res["status"] == "success"
+    assert res["value"] == 268477000000
+    assert res["formula"] == "assets - liabilities"
+    assert res["inputs"]["assets"] == 512163000000
+    assert res["inputs"]["liabilities"] == 243686000000
+    assert len(res["sources"]) == 2
+
+
+def test_22_missing_liabilities_net_assets_abstention() -> None:
+    """14. Missing liabilities returns unavailable without synthesizing data."""
+    facts = {
+        ("AMZN", 2024, "assets"): make_fact_row(ticker="AMZN", metric="assets", value=500000000000),
+        ("AMZN", 2024, "liabilities"): make_fact_row(ticker="AMZN", metric="liabilities", status="missing", value=None),
+    }
+    res = calculate_net_assets("AMZN", 2024, facts)
+    assert res["status"] == "unavailable"
+    assert "Liabilities data unavailable" in res["reason"]
+
+
+def test_23_json_serialization_of_all_public_results() -> None:
+    """16. All public result dictionaries are strictly JSON serializable."""
+    facts = {
+        ("MSFT", 2023, "revenue"): make_fact_row(ticker="MSFT", fy=2023, metric="revenue", value=200000),
+        ("MSFT", 2024, "revenue"): make_fact_row(ticker="MSFT", fy=2024, metric="revenue", value=250000),
+        ("MSFT", 2024, "net_income"): make_fact_row(ticker="MSFT", fy=2024, metric="net_income", value=50000),
+        ("MSFT", 2024, "assets"): make_fact_row(ticker="MSFT", fy=2024, metric="assets", value=500000),
+        ("MSFT", 2024, "liabilities"): make_fact_row(ticker="MSFT", fy=2024, metric="liabilities", value=200000),
+        ("AAPL", 2024, "assets"): make_fact_row(ticker="AAPL", fy=2024, metric="assets", value=350000),
+    }
+
+    g_res = calculate_growth("MSFT", "revenue", 2023, 2024, facts)
+    r_res = calculate_ratio("MSFT", 2024, "net_profit_margin", facts)
+    c_res = compare_companies("MSFT", "AAPL", 2024, "assets", facts)
+    na_res = calculate_net_assets("MSFT", 2024, facts)
+
+    for item in (g_res, r_res, c_res, na_res):
+        serialized = json.dumps(item)
+        assert isinstance(serialized, str)
+

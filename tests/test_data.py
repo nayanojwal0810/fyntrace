@@ -28,6 +28,7 @@ from src.sec_data import (
     normalize_cik,
     normalize_panel_facts,
     resolve_ticker,
+    sec_get_json,
     select_annual_filings_for_company,
     select_financial_fact,
     validate_companyfacts_response,
@@ -1249,7 +1250,7 @@ def test_fact_12_normalize_panel_facts_complete_450_records(tmp_path: Path) -> N
                         "filing_date": f"{fy+1}-02-15",
                         "report_date": rep_date,
                         "primary_document": f"{ticker.lower()}-{fy}.htm",
-                        "source_url": f"https://www.sec.gov/{accn}",
+                        "source_url": filing_url(cik_str, accn, f"{ticker.lower()}-{fy}.htm"),
                     }
                 )
 
@@ -1335,6 +1336,8 @@ def test_manifest_validation(tmp_path: Path) -> None:
         for ticker in tickers:
             cik_str = "0000034088" if ticker == "XOM" else f"{hash(ticker)%900000+100000:010d}"
             for fy in [2023, 2024, 2025]:
+                accn = f"{cik_str}-{str(fy)[2:]}-000001"
+                doc = f"{ticker.lower()}-{fy}.htm"
                 manifest_records.append(
                     {
                         "ticker": ticker,
@@ -1344,11 +1347,11 @@ def test_manifest_validation(tmp_path: Path) -> None:
                         "target_fiscal_year": fy,
                         "fiscal_year_status": "confirmed",
                         "form": "10-K",
-                        "accession_number": f"{cik_str}-{str(fy)[2:]}-000001",
+                        "accession_number": accn,
                         "filing_date": f"{fy+1}-02-15",
                         "report_date": f"{fy}-12-31",
-                        "primary_document": f"{ticker.lower()}-{fy}.htm",
-                        "source_url": f"https://www.sec.gov/{cik_str}",
+                        "primary_document": doc,
+                        "source_url": filing_url(cik_str, accn, doc),
                     }
                 )
 
@@ -1968,4 +1971,86 @@ def test_so_net_income_remains_missing_when_only_profit_loss_exists() -> None:
     res = select_financial_fact(manifest_so, "net_income", facts_profit_loss_only)
     assert res["status"] == "missing"
     assert res["value"] is None
+
+
+def test_sec_get_json_rejects_insecure_scheme() -> None:
+    """sec_get_json rejects non-HTTPS URLs."""
+    with pytest.raises(ValueError) as exc:
+        sec_get_json("http://www.sec.gov/files/company_tickers.json")
+    assert "HTTPS" in str(exc.value)
+
+
+def test_sec_get_json_rejects_untrusted_host() -> None:
+    """sec_get_json rejects unexpected or malicious hosts."""
+    with pytest.raises(ValueError) as exc:
+        sec_get_json("https://evil.com/files/company_tickers.json")
+    assert "Untrusted SEC host" in str(exc.value)
+
+
+def test_sec_get_json_rejects_path_traversal() -> None:
+    """sec_get_json rejects paths with traversal components."""
+    with pytest.raises(ValueError) as exc:
+        sec_get_json("https://www.sec.gov/files/../secret.json")
+    assert "traversal" in str(exc.value)
+
+
+def test_filing_url_rejects_invalid_accession_format() -> None:
+    """filing_url strictly enforces the 20-character EDGAR accession format."""
+    bad_accessions = ["0000789019-24", "not-an-accession", "000078901924000050", "0000789019-24-00005"]
+    for bad_accn in bad_accessions:
+        with pytest.raises(ValueError) as exc:
+            filing_url("0000789019", bad_accn, "doc.htm")
+        assert "accession" in str(exc.value).lower()
+
+
+def test_filing_url_rejects_unsafe_document_paths() -> None:
+    """filing_url rejects document names with slashes, backslashes, or directory traversal."""
+    bad_docs = ["../secret.txt", "sub/folder/doc.htm", "C:\\windows\\doc.htm", "", "doc/file.htm"]
+    for bad_doc in bad_docs:
+        with pytest.raises(ValueError) as exc:
+            filing_url("0000789019", "0000789019-24-000050", bad_doc)
+        assert "primary" in str(exc.value).lower() or "safe filename" in str(exc.value).lower()
+
+
+def test_filing_url_valid_sec_url() -> None:
+    """filing_url correctly forms official SEC URLs for valid inputs."""
+    url = filing_url("0000034088", "0000034088-25-000010", "xom-20241231.htm")
+    assert url == "https://www.sec.gov/Archives/edgar/data/34088/000003408825000010/xom-20241231.htm"
+
+
+def test_get_submissions_rejects_corrupted_cache(tmp_path: Path) -> None:
+    """get_submissions rejects corrupted or invalid cached JSON rather than returning it."""
+    sub_dir = tmp_path / "submissions"
+    sub_dir.mkdir(parents=True)
+    corrupt_cache = sub_dir / "CIK0000789019.json"
+    corrupt_cache.write_text('{"invalid": "payload"}', encoding="utf-8")
+
+    with pytest.raises(ValueError) as exc:
+        get_submissions("0000789019", cache_dir=tmp_path)
+    assert "validate" in str(exc.value).lower() or "missing" in str(exc.value).lower()
+
+
+def test_get_submissions_rejects_mismatched_cik_in_cache(tmp_path: Path) -> None:
+    """get_submissions rejects cache payload with CIK mismatch."""
+    sub_dir = tmp_path / "submissions"
+    sub_dir.mkdir(parents=True)
+    mismatched_cache = sub_dir / "CIK0000789019.json"
+    mismatched_cache.write_text('{"cik": "0000320193", "filings": {}}', encoding="utf-8")
+
+    with pytest.raises(ValueError) as exc:
+        get_submissions("0000789019", cache_dir=tmp_path)
+    assert "mismatch" in str(exc.value).lower()
+
+
+def test_get_companyfacts_rejects_corrupted_cache(tmp_path: Path) -> None:
+    """get_companyfacts rejects corrupted cached company facts."""
+    cf_dir = tmp_path / "companyfacts"
+    cf_dir.mkdir(parents=True)
+    corrupt_cache = cf_dir / "CIK0000789019.json"
+    corrupt_cache.write_text('{"cik": "0000789019", "facts": "not_a_dict"}', encoding="utf-8")
+
+    with pytest.raises(ValueError) as exc:
+        get_companyfacts("0000789019", cache_dir=tmp_path)
+    assert "invalid" in str(exc.value).lower() or "facts" in str(exc.value).lower()
+
 

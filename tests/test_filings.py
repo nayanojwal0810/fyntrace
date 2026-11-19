@@ -683,3 +683,44 @@ def test_deduplicate_repeated_ticker_and_years(tmp_path: Path) -> None:
     )
     assert summary["filings_requested"] == 1
     assert summary["filings_succeeded"] == 1
+
+
+def test_cross_reference_stub_receives_unknown_confidence() -> None:
+    """Confirm incorporation by reference stub headings receive unknown confidence."""
+    stub_text = (
+        "Item 7. Management's Discussion and Analysis of Financial Condition.\n\n"
+        "Reference is made to the section entitled Management's Discussion and Analysis "
+        "in the Financial Section of this report. All information is incorporated by reference.\n"
+    )
+    secs = extract_sections(stub_text)
+    assert len(secs) == 1
+    assert secs[0]["name"] == "unknown"
+    assert secs[0]["confidence"] == "unknown"
+
+
+def test_unbroken_long_narrative_chunking() -> None:
+    """Confirm a single unbroken long narrative (without blank lines) is properly chunked with exact offsets."""
+    sentence = "Our enterprise cloud platform provides scalable secure computing services to organizations globally. "
+    long_narrative = sentence * 60  # ~600 words on a single line
+    chunks = make_chunks(long_narrative, SAMPLE_FILING_RECORD_MSFT, "dummy_hash_narrative")
+    assert len(chunks) >= 2
+    for ch in chunks:
+        # Check chunk size bounds
+        w_count = len(ch["text"].split())
+        assert w_count <= 550
+        # Check exact offset match
+        assert long_narrative[ch["char_start"]:ch["char_end"]] == ch["text"]
+
+
+def test_long_table_row_preservation() -> None:
+    """Confirm long financial table rows preserve column boundaries without mid-cell splitting."""
+    row_cells = ["Segment A", "12,450", "13,900", "15,200", "(1,200)", "4.5%", "Approved"]
+    table_line = " | ".join(row_cells)
+    html = f"<html><body><table><tr>{''.join(f'<td>{c}</td>' for c in row_cells)}</tr></table></body></html>"
+    text = extract_visible_text(html)
+    assert table_line in text
+    chunks = make_chunks(text, SAMPLE_FILING_RECORD_MSFT, "dummy_hash_tbl")
+    assert len(chunks) >= 1
+    assert table_line in chunks[0]["text"]
+    assert text[chunks[0]["char_start"]:chunks[0]["char_end"]] == chunks[0]["text"]
+

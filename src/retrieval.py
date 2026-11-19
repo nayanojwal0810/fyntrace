@@ -124,8 +124,10 @@ def load_chunks(path: Path | str | None = None) -> list[dict[str, Any]]:
                 raise ValueError(f"Chunk '{chunk_id}' has missing 'source_url'.")
 
             parsed_url = urlparse(source_url)
-            if parsed_url.scheme.lower() not in ("http", "https") or parsed_url.netloc.lower() not in ("www.sec.gov", "sec.gov"):
-                raise ValueError(f"Chunk '{chunk_id}' source_url must be an official SEC URL on www.sec.gov or sec.gov, got {source_url!r}")
+            if parsed_url.scheme.lower() != "https" or parsed_url.netloc.lower() not in ("www.sec.gov", "sec.gov"):
+                raise ValueError(
+                    f"Chunk '{chunk_id}' source_url must be an official SEC URL on www.sec.gov or sec.gov with HTTPS scheme, got {source_url!r}"
+                )
 
             char_start = chunk.get("char_start")
             char_end = chunk.get("char_end")
@@ -210,11 +212,15 @@ def search_evidence(
     top_k: int = 5,
     k1: float = 1.5,
     b: float = 0.75,
+    accessions: list[str] | tuple[str, ...] | set[str] | None = None,
+    forms: list[str] | tuple[str, ...] | set[str] | None = None,
 ) -> dict[str, Any]:
     """Search filing evidence using BM25 with strict company and fiscal-year filtering.
 
     Calculates BM25 using statistics derived strictly from the eligible subset,
     preventing distortion from unrelated companies or fiscal years.
+    Applies optional accession and form constraints before scoring.
+    Ranks results by full-precision unrounded BM25 score, ties broken by chunk_id.
     """
     if not tickers or not isinstance(tickers, (list, tuple, set)):
         raise ValueError("tickers must be a non-empty list of ticker strings.")
@@ -231,10 +237,26 @@ def search_evidence(
     if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k < 1 or top_k > 20:
         raise ValueError(f"top_k must be an integer between 1 and 20, got {top_k!r}")
 
-    filters_dict = {
+    norm_accessions = None
+    if accessions is not None:
+        if not isinstance(accessions, (list, tuple, set)):
+            raise ValueError("accessions must be a list, tuple, or set of strings.")
+        norm_accessions = {str(a).strip() for a in accessions if str(a).strip()}
+
+    norm_forms = None
+    if forms is not None:
+        if not isinstance(forms, (list, tuple, set)):
+            raise ValueError("forms must be a list, tuple, or set of strings.")
+        norm_forms = {str(f).strip().upper() for f in forms if str(f).strip()}
+
+    filters_dict: dict[str, Any] = {
         "tickers": norm_tickers,
         "fiscal_years": norm_years,
     }
+    if norm_accessions is not None:
+        filters_dict["accessions"] = sorted(norm_accessions)
+    if norm_forms is not None:
+        filters_dict["forms"] = sorted(norm_forms)
 
     if not isinstance(query, str) or not query.strip():
         return {
@@ -255,11 +277,20 @@ def search_evidence(
             "message": "Query produced no searchable terms after tokenization.",
         }
 
-    # 1. Filter eligible chunk IDs before scoring
+    # 1. Filter eligible chunk IDs before scoring (applying company, year, accession, and form constraints)
     target_pairs = {(t, y) for t in norm_tickers for y in norm_years}
-    eligible_chunk_ids: list[str] = []
+    candidate_chunk_ids: list[str] = []
     for pair in sorted(target_pairs):
-        eligible_chunk_ids.extend(index.get("company_year_chunks", {}).get(pair, []))
+        candidate_chunk_ids.extend(index.get("company_year_chunks", {}).get(pair, []))
+
+    eligible_chunk_ids: list[str] = []
+    for cid in candidate_chunk_ids:
+        chunk = index["chunks_by_id"][cid]
+        if norm_accessions is not None and chunk["accession"] not in norm_accessions:
+            continue
+        if norm_forms is not None and chunk.get("form", "").strip().upper() not in norm_forms:
+            continue
+        eligible_chunk_ids.append(cid)
 
     if not eligible_chunk_ids:
         return {
@@ -267,7 +298,7 @@ def search_evidence(
             "query": query,
             "filters": filters_dict,
             "results": [],
-            "message": f"No indexed filings found for requested tickers/years: {norm_tickers} {norm_years}",
+            "message": f"No indexed filings found matching requested filters.",
         }
 
     # 2. Derive BM25 corpus statistics from the eligible subset only
@@ -307,11 +338,18 @@ def search_evidence(
             "message": "No matching evidence found for query in requested filings.",
         }
 
-    # 4. Assemble and rank results descending by score, deterministic tie-breaking on chunk_id
-    results_list: list[dict[str, Any]] = []
+    # 4. Rank candidates using full unrounded BM25 score, ties broken ascending by chunk_id
+    candidates = []
     for cid, score in scores.items():
+        candidates.append((score, cid))
+
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    top_candidates = candidates[:top_k]
+
+    top_results: list[dict[str, Any]] = []
+    for score, cid in top_candidates:
         chunk = index["chunks_by_id"][cid]
-        results_list.append({
+        top_results.append({
             "chunk_id": chunk["chunk_id"],
             "ticker": chunk["ticker"],
             "company_name": chunk["company_name"],
@@ -327,9 +365,6 @@ def search_evidence(
             "char_end": chunk["char_end"],
             "file_sha256": chunk["file_sha256"],
         })
-
-    results_list.sort(key=lambda x: (-x["score"], x["chunk_id"]))
-    top_results = results_list[:top_k]
 
     return {
         "status": "success",

@@ -28,6 +28,7 @@ def make_valid_chunk(
     section_confidence: str = "high",
     accession: str = "0000000000-24-000001",
     cik: str = "0000000001",
+    form: str = "10-K",
     source_url: str = "https://www.sec.gov/Archives/edgar/data/1/000000000024000001/test-20241231.htm",
     file_sha256: str = "a" * 64,
 ) -> dict:
@@ -38,7 +39,7 @@ def make_valid_chunk(
         "company_name": f"{ticker} CORP",
         "cik": cik,
         "fiscal_year": fiscal_year,
-        "form": "10-K",
+        "form": form,
         "accession": accession,
         "report_date": f"{fiscal_year}-12-31",
         "section": section,
@@ -418,3 +419,63 @@ def test_20_cli_argument_parsing_and_execution(tmp_path: Path) -> None:
 
     with patch("sys.argv", ["retrieval.py", "--query", "cloud risks", "--tickers", "MSFT", "--years", "2024", "--chunks-path", str(chunks_file)]):
         main()
+
+
+def test_21_full_precision_ranking_before_display_rounding() -> None:
+    """Full-precision BM25 score is used for ranking; display rounding to 4 decimals does not distort ranking."""
+    # Chunk A has slightly fewer total words than Chunk B, so its doc_len is smaller -> slightly higher BM25 score.
+    # We craft two chunks with same term frequency of query word 'alpha', but Chunk B has an extra padding word.
+    c_a = make_valid_chunk("CHUNK_A", ticker="MSFT", fiscal_year=2024, text="alpha " + "beta " * 100)
+    c_b = make_valid_chunk("CHUNK_B", ticker="MSFT", fiscal_year=2024, text="alpha " + "beta " * 101)
+
+    idx = build_index([c_b, c_a])
+    res = search_evidence("alpha", ["MSFT"], [2024], idx, top_k=2)
+
+    assert res["status"] == "success"
+    assert len(res["results"]) == 2
+    # CHUNK_A has shorter length, so its BM25 score is strictly higher at unrounded float precision
+    assert res["results"][0]["chunk_id"] == "CHUNK_A"
+    assert res["results"][1]["chunk_id"] == "CHUNK_B"
+
+
+def test_22_accession_isolation_filtering() -> None:
+    """Search evidence respects accession filter applied before scoring."""
+    c1 = make_valid_chunk("C_ACC1", ticker="MSFT", fiscal_year=2024, accession="0000950170-24-000001", text="operating revenue streams")
+    c2 = make_valid_chunk("C_ACC2", ticker="MSFT", fiscal_year=2024, accession="0000950170-24-000002", text="operating revenue streams")
+
+    idx = build_index([c1, c2])
+    res = search_evidence("revenue", ["MSFT"], [2024], idx, accessions=["0000950170-24-000001"])
+    assert res["status"] == "success"
+    assert len(res["results"]) == 1
+    assert res["results"][0]["chunk_id"] == "C_ACC1"
+    assert res["results"][0]["accession"] == "0000950170-24-000001"
+
+
+def test_23_form_isolation_filtering() -> None:
+    """Search evidence respects form filter applied before scoring."""
+    c1 = make_valid_chunk("C_10K", ticker="MSFT", fiscal_year=2024, form="10-K", text="annual risk factors")
+    c2 = make_valid_chunk("C_10Q", ticker="MSFT", fiscal_year=2024, form="10-Q", text="quarterly risk factors")
+
+    idx = build_index([c1, c2])
+    res = search_evidence("risk", ["MSFT"], [2024], idx, forms=["10-K"])
+    assert res["status"] == "success"
+    assert len(res["results"]) == 1
+    assert res["results"][0]["chunk_id"] == "C_10K"
+
+
+def test_24_unrelated_companies_do_not_distort_scores() -> None:
+    """Adding unrelated companies to the index does not change the BM25 score of chunks within an isolated query."""
+    c_target = make_valid_chunk("TARGET_1", ticker="MSFT", fiscal_year=2024, text="unique keyword query")
+    c_other = make_valid_chunk("OTHER_1", ticker="AAPL", fiscal_year=2024, text="unique keyword query extra words")
+
+    idx_isolated = build_index([c_target])
+    res_isolated = search_evidence("unique keyword", ["MSFT"], [2024], idx_isolated)
+
+    idx_combined = build_index([c_target, c_other])
+    res_combined = search_evidence("unique keyword", ["MSFT"], [2024], idx_combined)
+
+    assert res_isolated["status"] == "success"
+    assert res_combined["status"] == "success"
+    # The score of TARGET_1 must be mathematically identical because eligible subset statistics are used
+    assert res_isolated["results"][0]["score"] == res_combined["results"][0]["score"]
+
