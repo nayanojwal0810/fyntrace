@@ -332,35 +332,138 @@ def test_empty_results_and_invalid_inputs(tmp_path: Path):
         search("cloud", db_path=tmp_path / "nonexistent.sqlite")
 
 
-def test_failed_index_rebuild_preserves_existing_valid_index(tmp_path: Path, monkeypatch):
-    """An indexing failure during rebuild preserves the previous working index untouched."""
-    chunks_path, _ = _make_synthetic_corpus(tmp_path)
+def test_failed_index_rebuild_preserves_existing_valid_index(tmp_path: Path):
+    """Failure after temporary DB construction and partial chunk insertion preserves existing index."""
+    chunks_path, chunks = _make_synthetic_corpus(tmp_path)
     db_path = tmp_path / "protected_retrieval.sqlite"
+
+    # 1. Build initial valid index and save bytes
+    build_index(chunks_path=chunks_path, db_path=db_path)
+    orig_db_bytes = db_path.read_bytes()
+    initial_res = search("cloud", db_path=db_path, top_k=5)
+    assert len(initial_res) > 0
+
+    # 2. Create another corpus with 2 valid records followed by malformed JSON
+    corrupt_corpus = tmp_path / "corrupt_chunks.jsonl"
+    with corrupt_corpus.open("w", encoding="utf-8") as f:
+        f.write(json.dumps(chunks[0]) + "\n")
+        f.write(json.dumps(chunks[1]) + "\n")
+        f.write('{"chunk_id": "corrupt_chunk", "ticker": "MSFT", malformed_json...\n')
+
+    # 3. Rebuild with batch_size=1 so at least one batch is inserted before failure
+    with pytest.raises(Exception):
+        build_index(chunks_path=corrupt_corpus, db_path=db_path, batch_size=1)
+
+    # 4. Confirm original database bytes remain completely unchanged
+    assert db_path.read_bytes() == orig_db_bytes
+
+    # 5. Confirm searches against the old database still work normally
+    post_res = search("cloud", db_path=db_path, top_k=5)
+    assert [r["chunk_id"] for r in post_res] == [r["chunk_id"] for r in initial_res]
+
+    # 6. Confirm temporary database was removed
+    assert not (tmp_path / f"{db_path.name}.tmp").exists()
+
+
+def test_empty_and_whitespace_corpus_rejected_preserving_existing_index(tmp_path: Path):
+    """Empty or whitespace-only corpus files are rejected and do not replace existing index."""
+    chunks_path, _ = _make_synthetic_corpus(tmp_path)
+    db_path = tmp_path / "protected_empty.sqlite"
 
     # Build initial valid index
     build_index(chunks_path=chunks_path, db_path=db_path)
-    initial_res = search("cloud", db_path=db_path, top_k=5)
-    assert len(initial_res) > 0
     orig_db_bytes = db_path.read_bytes()
 
-    # Simulate failure during a rebuild attempt (e.g. error rebuilding FTS5)
-    real_sha256 = hashlib.sha256
-    def fail_after_start(*args, **kwargs):
-        raise RuntimeError("Simulated failure mid-index rebuild")
+    # Empty corpus
+    empty_corpus = tmp_path / "empty_chunks.jsonl"
+    empty_corpus.write_text("", encoding="utf-8")
 
-    # Monkeypatch compute_file_sha256 or something in the build process
-    monkeypatch.setattr("fyntrace.retrieval.compute_file_sha256", fail_after_start)
-
-    with pytest.raises(RuntimeError, match="Simulated failure mid-index rebuild"):
-        build_index(chunks_path=chunks_path, db_path=db_path)
-
-    # The existing database file must be completely preserved
+    with pytest.raises(ValueError, match="contains no valid chunks"):
+        build_index(chunks_path=empty_corpus, db_path=db_path)
     assert db_path.read_bytes() == orig_db_bytes
-    post_res = search("cloud", db_path=db_path, top_k=5)
-    assert len(post_res) == len(initial_res)
 
-    # Ensure no temporary files remained
-    assert not (tmp_path / f"{db_path.name}.tmp").exists()
+    # Whitespace-only corpus
+    ws_corpus = tmp_path / "whitespace_chunks.jsonl"
+    ws_corpus.write_text("\n   \n\t\n  \n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="contains no valid chunks"):
+        build_index(chunks_path=ws_corpus, db_path=db_path)
+    assert db_path.read_bytes() == orig_db_bytes
+
+    # Search still works
+    res = search("cloud", db_path=db_path, top_k=5)
+    assert len(res) > 0
+
+
+def test_invalid_batch_size_rejected(tmp_path: Path):
+    """Invalid batch_size values (zero, negative, non-int) must raise ValueError."""
+    chunks_path, _ = _make_synthetic_corpus(tmp_path)
+    db_path = tmp_path / "batch_size_test.sqlite"
+
+    for invalid_bs in [0, -1, -500, "100", True, 2.5]:
+        with pytest.raises(ValueError, match="batch_size must be a positive integer"):
+            build_index(chunks_path=chunks_path, db_path=db_path, batch_size=invalid_bs)  # type: ignore
+
+
+def test_fiscal_year_aliases_validation(tmp_path: Path):
+    """Matching year/fiscal_year are accepted; conflicting or invalid values raise ValueError."""
+    chunks_path, _ = _make_synthetic_corpus(tmp_path)
+    db_path = tmp_path / "alias_test.sqlite"
+    build_index(chunks_path=chunks_path, db_path=db_path)
+
+    # Neither supplied: no filter
+    res_both_none = search("revenue", db_path=db_path, top_k=10)
+    assert len(res_both_none) > 0
+
+    # Only year supplied
+    res_year = search("revenue", year=2024, db_path=db_path, top_k=10)
+    assert all(r["fiscal_year"] == 2024 for r in res_year)
+
+    # Only fiscal_year supplied
+    res_fy = search("revenue", fiscal_year=2024, db_path=db_path, top_k=10)
+    assert all(r["fiscal_year"] == 2024 for r in res_fy)
+
+    # Both supplied and matching
+    res_matching = search("revenue", year=2024, fiscal_year=2024, db_path=db_path, top_k=10)
+    assert [r["chunk_id"] for r in res_matching] == [r["chunk_id"] for r in res_year]
+
+    # Both supplied but conflicting
+    with pytest.raises(ValueError, match="Conflicting fiscal year filters"):
+        search("revenue", year=2024, fiscal_year=2025, db_path=db_path)
+
+    # Invalid year types and values
+    with pytest.raises(ValueError, match="year must be an integer"):
+        search("revenue", year="invalid_year", db_path=db_path)
+
+    with pytest.raises(ValueError, match="fiscal_year must be an integer"):
+        search("revenue", fiscal_year="bad", db_path=db_path)
+
+    with pytest.raises(ValueError, match="must be an integer, got boolean"):
+        search("revenue", year=True, db_path=db_path)
+
+    with pytest.raises(ValueError, match="must be a positive integer"):
+        search("revenue", year=-2024, db_path=db_path)
+
+    with pytest.raises(ValueError, match="must be a positive integer"):
+        search("revenue", year=0, db_path=db_path)
+
+
+def test_fts5_integrity_check(tmp_path: Path):
+    """External content FTS5 integrity check executes successfully during build."""
+    chunks_path, _ = _make_synthetic_corpus(tmp_path)
+    db_path = tmp_path / "integrity_test.sqlite"
+
+    summary = build_index(chunks_path=chunks_path, db_path=db_path)
+    assert summary["indexed_chunks"] == 6
+    assert db_path.is_file()
+
+    # Manual verification of the integrity check command on the built DB
+    import sqlite3
+    con = sqlite3.connect(str(db_path))
+    try:
+        con.execute("INSERT INTO chunks_fts(chunks_fts, rank) VALUES('integrity-check', 1);")
+    finally:
+        con.close()
 
 
 def test_no_network_requests(tmp_path: Path, monkeypatch):

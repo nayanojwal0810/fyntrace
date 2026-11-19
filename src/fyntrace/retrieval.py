@@ -90,6 +90,19 @@ def init_schema(con: sqlite3.Connection) -> None:
     """)
 
 
+def _validate_year(val: Any, param_name: str) -> int:
+    """Validate and parse a fiscal year parameter."""
+    if isinstance(val, bool):
+        raise ValueError(f"{param_name} must be an integer, got boolean {val!r}")
+    try:
+        y = int(val)
+    except (ValueError, TypeError):
+        raise ValueError(f"{param_name} must be an integer, got {val!r}")
+    if y <= 0:
+        raise ValueError(f"{param_name} must be a positive integer, got {y}")
+    return y
+
+
 def build_index(
     chunks_path: Path | str | None = None,
     db_path: Path | str | None = None,
@@ -100,6 +113,9 @@ def build_index(
     Uses a temporary SQLite database, verifies chunk counts, closes connections,
     and atomically replaces any existing database file on completion.
     """
+    if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size <= 0:
+        raise ValueError(f"batch_size must be a positive integer, got {batch_size!r}")
+
     if chunks_path is None:
         chunks_file = Path("data/processed/chunks.jsonl")
     else:
@@ -174,6 +190,11 @@ def build_index(
                     """, batch)
                     batch = []
 
+        if chunk_count == 0:
+            raise ValueError(
+                f"Cannot build index: corpus file {chunks_file} contains no valid chunks."
+            )
+
         if batch:
             con.executemany("""
                 INSERT INTO chunks (
@@ -186,6 +207,9 @@ def build_index(
 
         # Rebuild FTS5 inverted index from populated chunks table
         con.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild');")
+
+        # Run FTS5 external content integrity check
+        con.execute("INSERT INTO chunks_fts(chunks_fts, rank) VALUES('integrity-check', 1);")
 
         # Verify indexed counts
         chunks_count_db = con.execute("SELECT COUNT(*) FROM chunks;").fetchone()[0]
@@ -298,12 +322,19 @@ def search(
     if not isinstance(top_k, int) or top_k < 1 or top_k > 20:
         raise ValueError(f"top_k must be an integer between 1 and 20, got {top_k}")
 
-    effective_year = year if year is not None else fiscal_year
-    if effective_year is not None:
-        try:
-            effective_year = int(effective_year)
-        except (ValueError, TypeError):
-            raise ValueError(f"year must be an integer, got {effective_year}")
+    effective_year: int | None = None
+    if year is not None and fiscal_year is not None:
+        y1 = _validate_year(year, "year")
+        y2 = _validate_year(fiscal_year, "fiscal_year")
+        if y1 != y2:
+            raise ValueError(
+                f"Conflicting fiscal year filters: year={year!r} and fiscal_year={fiscal_year!r}"
+            )
+        effective_year = y1
+    elif year is not None:
+        effective_year = _validate_year(year, "year")
+    elif fiscal_year is not None:
+        effective_year = _validate_year(fiscal_year, "fiscal_year")
 
     if db_path is None:
         sqlite_file = Path("data/processed/retrieval.sqlite")
