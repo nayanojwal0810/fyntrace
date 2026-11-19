@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 import pytest
+import requests
 
 from fyntrace.sec_data import (
     AmbiguousFilingError,
@@ -27,6 +28,15 @@ from fyntrace.sec_data import (
     validate_sec_url,
     validate_user_agent,
 )
+
+
+@pytest.fixture(autouse=True)
+def guard_no_outbound_network(monkeypatch):
+    """Network guard to fail tests immediately if an unexpected real network request occurs."""
+    def forbidden_send(self, *args, **kwargs):
+        raise RuntimeError("Unexpected real network request attempted during offline tests.")
+
+    monkeypatch.setattr(requests.Session, "send", forbidden_send)
 
 
 def test_valid_ticker_resolves_to_zero_padded_cik():
@@ -545,7 +555,13 @@ def test_smaller_collection_preserves_unrelated_validated_records(tmp_path):
     raw_dir.mkdir(parents=True)
     processed_dir.mkdir(parents=True)
 
-    # Pre-populate manifest with MSFT and WMT
+    # 1. Pre-populate WMT local file and manifest
+    (raw_dir / "filings").mkdir(parents=True)
+    wmt_html = b"<!DOCTYPE html><html><body>WMT 10K content " + b"W" * 1500 + b"</body></html>"
+    wmt_file = raw_dir / "filings" / "WMT_2024_000010416924000056.html"
+    wmt_file.write_bytes(wmt_html)
+    wmt_sha = hashlib.sha256(wmt_html).hexdigest()
+
     manifest_data = {
         "company_identities": [
             {"ticker": "MSFT", "cik": "0000789019", "name": "Microsoft Corp", "sector": "Technology"},
@@ -553,18 +569,16 @@ def test_smaller_collection_preserves_unrelated_validated_records(tmp_path):
         ],
         "filings": [
             {
-                "ticker": "MSFT",
-                "fiscal_year": 2024,
-                "status": "downloaded",
-                "accession": "0000950170-24-087843",
-                "form": "10-K",
-            },
-            {
                 "ticker": "WMT",
                 "fiscal_year": 2024,
                 "status": "downloaded",
                 "accession": "0000104169-24-000056",
                 "form": "10-K",
+                "local_path": str(wmt_file.as_posix()),
+                "file_sha256": wmt_sha,
+                "selected_metrics": ["assets"],
+                "unavailable_metrics": {},
+                "errors": [],
             },
         ],
     }
@@ -572,43 +586,90 @@ def test_smaller_collection_preserves_unrelated_validated_records(tmp_path):
 
     wmt_fact = {
         "ticker": "WMT",
+        "cik": "0000104169",
+        "company_name": "Walmart Inc",
+        "sector": "Consumer",
         "fiscal_year": 2024,
         "metric": "assets",
+        "taxonomy": "us-gaap",
+        "tag": "Assets",
         "value": 252399000000,
         "unit": "USD",
-        "tag": "Assets",
+        "form": "10-K",
+        "accession": "0000104169-24-000056",
     }
-    msft_fact = {
-        "ticker": "MSFT",
-        "fiscal_year": 2024,
-        "metric": "assets",
-        "value": 512163000000,
-        "unit": "USD",
-        "tag": "Assets",
-    }
-    (processed_dir / "facts.jsonl").write_text(
-        json.dumps(msft_fact) + "\n" + json.dumps(wmt_fact) + "\n", encoding="utf-8"
-    )
+    (processed_dir / "facts.jsonl").write_text(json.dumps(wmt_fact) + "\n", encoding="utf-8")
 
-    # Mock submissions and company facts for MSFT
+    # 2. Provide complete small mock SEC data for MSFT so no live network requests occur
     mapping = {
         "0": {"cik_str": 789019, "ticker": "MSFT", "title": "Microsoft Corp"},
         "1": {"cik_str": 104169, "ticker": "WMT", "title": "Walmart Inc"},
     }
     (raw_dir / "company_tickers.json").write_text(json.dumps(mapping), encoding="utf-8")
 
-    # Run collection ONLY for MSFT 2024
+    sub_data = {
+        "cik": "0000789019",
+        "fiscalYearEnd": "0630",
+        "filings": {
+            "recent": {
+                "form": ["10-K"],
+                "reportDate": ["2024-06-30"],
+                "filingDate": ["2024-07-30"],
+                "accessionNumber": ["0000950170-24-087843"],
+                "primaryDocument": ["msft-20240630.htm"],
+            }
+        },
+    }
+    (raw_dir / "submissions").mkdir(parents=True, exist_ok=True)
+    (raw_dir / "submissions" / "CIK0000789019.json").write_text(json.dumps(sub_data), encoding="utf-8")
+
+    cf_data = {
+        "cik": 789019,
+        "entityName": "Microsoft Corp",
+        "facts": {
+            "us-gaap": {
+                "Assets": {
+                    "units": {
+                        "USD": [
+                            {"end": "2024-06-30", "val": 512163000000, "form": "10-K", "accn": "0000950170-24-087843"}
+                        ]
+                    }
+                }
+            }
+        },
+    }
+    (raw_dir / "companyfacts").mkdir(parents=True, exist_ok=True)
+    (raw_dir / "companyfacts" / "CIK0000789019.json").write_text(json.dumps(cf_data), encoding="utf-8")
+
+    msft_html = b"<!DOCTYPE html><html><body>MSFT 10K content " + b"M" * 1500 + b"</body></html>"
+    msft_file = raw_dir / "filings" / "MSFT_2024_000095017024087843.html"
+    msft_file.write_bytes(msft_html)
+
+    # 3. Run smaller collection ONLY for MSFT 2024
     res = collect_data(tickers=["MSFT"], years=[2024], cache_dir=raw_dir, user_agent="TestApp/1.0 test@sec.gov")
+    curr = res["summary"]["current_run"]
 
-    # Manifest must still contain WMT 2024!
-    filing_tickers = {f["ticker"] for f in res["filings"]}
-    assert "WMT" in filing_tickers
-    assert "MSFT" in filing_tickers
-
-    # facts.jsonl must still contain WMT!
+    # Assertions required by Section 1:
+    # - The requested MSFT collection succeeds.
+    assert curr["successful_filings"] == 1
+    # - The current run reports zero failed filings.
+    assert curr["failed_filings"] == 0
+    # - The existing WMT filing remains unchanged.
+    wmt_filing = next(f for f in res["filings"] if f["ticker"] == "WMT" and f["fiscal_year"] == 2024)
+    assert wmt_filing["status"] == "downloaded"
+    assert wmt_filing["accession"] == "0000104169-24-000056"
+    assert wmt_filing["file_sha256"] == wmt_sha
+    # - The existing WMT financial fact remains unchanged.
     with (processed_dir / "facts.jsonl").open("r", encoding="utf-8") as f:
-        fact_tickers = {json.loads(line)["ticker"] for line in f if line.strip()}
-    assert "WMT" in fact_tickers
+        stored_facts = [json.loads(line) for line in f if line.strip()]
+    wmt_facts = [f for f in stored_facts if f["ticker"] == "WMT"]
+    assert len(wmt_facts) == 1
+    assert wmt_facts[0]["value"] == 252399000000
+    # - The newly collected MSFT fact is valid.
+    msft_facts = [f for f in stored_facts if f["ticker"] == "MSFT"]
+    assert len(msft_facts) == 1
+    assert msft_facts[0]["value"] == 512163000000
+    assert msft_facts[0]["accession"] == "0000950170-24-087843"
 
 
 def test_repeated_collection_does_not_duplicate_facts(tmp_path, sample_filing):
@@ -762,3 +823,275 @@ def test_get_fact_and_get_filing_lookups(tmp_path):
 
     with pytest.raises(KeyError):
         get_filing("AAPL", 2024, processed_dir=processed_dir)
+
+
+def test_revenue_two_different_values_same_tag_rejected(sample_filing):
+    cf = {
+        "cik": 789019,
+        "facts": {
+            "us-gaap": {
+                "Revenues": {
+                    "units": {
+                        "USD": [
+                            {"start": "2023-07-01", "end": "2024-06-30", "val": 245122000000, "form": "10-K", "accn": "0000950170-24-087843"},
+                            {"start": "2023-07-01", "end": "2024-06-30", "val": 250000000000, "form": "10-K", "accn": "0000950170-24-087843"},
+                        ]
+                    }
+                }
+            }
+        },
+    }
+    fact = normalize_annual_fact(cf, sample_filing, "revenue")
+    assert fact is None
+
+
+def test_revenue_two_identical_records_same_tag_accepted(sample_filing):
+    cf = {
+        "cik": 789019,
+        "facts": {
+            "us-gaap": {
+                "Revenues": {
+                    "units": {
+                        "USD": [
+                            {"start": "2023-07-01", "end": "2024-06-30", "val": 245122000000, "form": "10-K", "accn": "0000950170-24-087843"},
+                            {"start": "2023-07-01", "end": "2024-06-30", "val": 245122000000, "form": "10-K", "accn": "0000950170-24-087843"},
+                        ]
+                    }
+                }
+            }
+        },
+    }
+    fact = normalize_annual_fact(cf, sample_filing, "revenue")
+    assert fact is not None
+    assert fact["value"] == 245122000000
+
+
+def test_revenue_conflicting_values_across_different_tags_rejected(sample_filing):
+    cf = {
+        "cik": 789019,
+        "facts": {
+            "us-gaap": {
+                "Revenues": {
+                    "units": {
+                        "USD": [
+                            {"start": "2023-07-01", "end": "2024-06-30", "val": 245122000000, "form": "10-K", "accn": "0000950170-24-087843"}
+                        ]
+                    }
+                },
+                "SalesRevenueNet": {
+                    "units": {
+                        "USD": [
+                            {"start": "2023-07-01", "end": "2024-06-30", "val": 250000000000, "form": "10-K", "accn": "0000950170-24-087843"}
+                        ]
+                    }
+                },
+            }
+        },
+    }
+    fact = normalize_annual_fact(cf, sample_filing, "revenue")
+    assert fact is None
+
+
+def test_source_hash_preserves_real_cached_bytes_and_none_for_mock_data(tmp_path, sample_filing):
+    in_memory_cf = {
+        "cik": 789019,
+        "facts": {
+            "us-gaap": {
+                "Assets": {
+                    "units": {
+                        "USD": [
+                            {"end": "2024-06-30", "val": 512163000000, "form": "10-K", "accn": "0000950170-24-087843"}
+                        ]
+                    }
+                }
+            }
+        },
+    }
+    # In-memory mock data without _file_sha256 returns None
+    fact_mock = normalize_annual_fact(in_memory_cf, sample_filing, "assets")
+    assert fact_mock is not None
+    assert fact_mock["companyfacts_sha256"] is None
+
+    # Real cached file on disk has verified SHA-256
+    cf_dir = tmp_path / "raw" / "companyfacts"
+    cf_dir.mkdir(parents=True)
+    raw_file = cf_dir / "CIK0000789019.json"
+    content_bytes = json.dumps(in_memory_cf).encode("utf-8")
+    raw_file.write_bytes(content_bytes)
+    expected_sha = hashlib.sha256(content_bytes).hexdigest()
+
+    loaded_cf = get_companyfacts("0000789019", raw_dir=tmp_path / "raw")
+    fact_real = normalize_annual_fact(loaded_cf, sample_filing, "assets")
+    assert fact_real is not None
+    assert fact_real["companyfacts_sha256"] == expected_sha
+
+
+def test_company_identity_mismatch_rejected(sample_filing):
+    mismatched_cf = {
+        "cik": "0000320193",  # AAPL CIK vs MSFT sample_filing
+        "facts": {
+            "us-gaap": {
+                "Assets": {
+                    "units": {
+                        "USD": [
+                            {"end": "2024-06-30", "val": 512163000000, "form": "10-K", "accn": "0000950170-24-087843"}
+                        ]
+                    }
+                }
+            }
+        },
+    }
+    with pytest.raises(ValueError, match="Company identity mismatch"):
+        normalize_annual_fact(mismatched_cf, sample_filing, "assets")
+
+
+def test_corrupted_manifest_file_rejected_without_overwriting(tmp_path):
+    raw_dir = tmp_path / "raw"
+    processed_dir = tmp_path / "processed"
+    raw_dir.mkdir(parents=True)
+    processed_dir.mkdir(parents=True)
+    manifest_file = processed_dir / "manifest.json"
+    manifest_file.write_text("{ corrupt json ...", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Corrupted or invalid manifest"):
+        collect_data(tickers=["MSFT"], years=[2024], cache_dir=raw_dir)
+
+    assert manifest_file.read_text(encoding="utf-8") == "{ corrupt json ..."
+
+
+def test_corrupted_facts_file_rejected_without_overwriting(tmp_path):
+    raw_dir = tmp_path / "raw"
+    processed_dir = tmp_path / "processed"
+    raw_dir.mkdir(parents=True)
+    processed_dir.mkdir(parents=True)
+    manifest_file = processed_dir / "manifest.json"
+    manifest_file.write_text(json.dumps({"filings": [], "company_identities": []}), encoding="utf-8")
+    facts_file = processed_dir / "facts.jsonl"
+    facts_file.write_text('{"ticker": "MSFT", "fiscal_year": 2024, "metric": "assets"}\n{ invalid json line\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Corrupted or invalid facts file"):
+        collect_data(tickers=["MSFT"], years=[2024], cache_dir=raw_dir)
+
+
+def test_failed_refresh_preserves_valid_filing_and_facts(tmp_path):
+    raw_dir = tmp_path / "raw"
+    processed_dir = tmp_path / "processed"
+    raw_dir.mkdir(parents=True)
+    processed_dir.mkdir(parents=True)
+
+    filings_dir = raw_dir / "filings"
+    filings_dir.mkdir(parents=True)
+    html_content = b"<!DOCTYPE html><html><body>MSFT 10K content " + b"M" * 1500 + b"</body></html>"
+    msft_file = filings_dir / "MSFT_2024_000095017024087843.html"
+    msft_file.write_bytes(html_content)
+    file_sha = hashlib.sha256(html_content).hexdigest()
+
+    manifest_data = {
+        "company_identities": [
+            {"ticker": "MSFT", "cik": "0000789019", "name": "Microsoft Corp", "sector": "Technology"},
+        ],
+        "filings": [
+            {
+                "ticker": "MSFT",
+                "fiscal_year": 2024,
+                "status": "downloaded",
+                "accession": "0000950170-24-087843",
+                "form": "10-K",
+                "local_path": str(msft_file.as_posix()),
+                "file_sha256": file_sha,
+                "selected_metrics": ["assets"],
+                "unavailable_metrics": {},
+                "errors": [],
+            }
+        ],
+    }
+    (processed_dir / "manifest.json").write_text(json.dumps(manifest_data), encoding="utf-8")
+
+    fact = {
+        "ticker": "MSFT",
+        "cik": "0000789019",
+        "company_name": "Microsoft Corp",
+        "sector": "Technology",
+        "fiscal_year": 2024,
+        "metric": "assets",
+        "taxonomy": "us-gaap",
+        "tag": "Assets",
+        "value": 512163000000,
+        "unit": "USD",
+        "form": "10-K",
+        "accession": "0000950170-24-087843",
+    }
+    (processed_dir / "facts.jsonl").write_text(json.dumps(fact) + "\n", encoding="utf-8")
+
+    mock_session = MagicMock()
+    mock_resp = MagicMock()
+    mock_resp.status_code = 403
+    mock_session.get.return_value = mock_resp
+
+    res = collect_data(tickers=["MSFT"], years=[2024], cache_dir=raw_dir, session=mock_session)
+    curr = res["summary"]["current_run"]
+
+    assert curr["failed_filings"] == 1
+    assert curr["successful_filings"] == 0
+
+    preserved_filing = next(f for f in res["filings"] if f["ticker"] == "MSFT")
+    assert preserved_filing["status"] == "downloaded"
+    assert preserved_filing["accession"] == "0000950170-24-087843"
+    assert any("Refresh failed" in err for err in preserved_filing.get("errors", []))
+
+    with (processed_dir / "facts.jsonl").open("r", encoding="utf-8") as f:
+        stored = [json.loads(line) for line in f if line.strip()]
+    assert len(stored) == 1
+    assert stored[0]["value"] == 512163000000
+
+
+def test_failed_refresh_clears_stale_facts_for_invalid_filing(tmp_path):
+    raw_dir = tmp_path / "raw"
+    processed_dir = tmp_path / "processed"
+    raw_dir.mkdir(parents=True)
+    processed_dir.mkdir(parents=True)
+
+    manifest_data = {
+        "company_identities": [
+            {"ticker": "MSFT", "cik": "0000789019", "name": "Microsoft Corp", "sector": "Technology"},
+        ],
+        "filings": [
+            {
+                "ticker": "MSFT",
+                "fiscal_year": 2024,
+                "status": "failed",
+                "accession": None,
+                "form": "10-K",
+                "local_path": None,
+                "file_sha256": None,
+            }
+        ],
+    }
+    (processed_dir / "manifest.json").write_text(json.dumps(manifest_data), encoding="utf-8")
+
+    stale_fact = {
+        "ticker": "MSFT",
+        "fiscal_year": 2024,
+        "metric": "assets",
+        "value": 999999999,
+        "unit": "USD",
+    }
+    (processed_dir / "facts.jsonl").write_text(json.dumps(stale_fact) + "\n", encoding="utf-8")
+
+    mock_session = MagicMock()
+    mock_resp = MagicMock()
+    mock_resp.status_code = 403
+    mock_session.get.return_value = mock_resp
+
+    res = collect_data(tickers=["MSFT"], years=[2024], cache_dir=raw_dir, session=mock_session)
+    assert res["summary"]["current_run"]["failed_filings"] == 1
+
+    with (processed_dir / "facts.jsonl").open("r", encoding="utf-8") as f:
+        stored = [json.loads(line) for line in f if line.strip()]
+    assert len(stored) == 0
+
+
+def test_network_guard_blocks_real_http_calls():
+    s = requests.Session()
+    with pytest.raises(RuntimeError, match="Unexpected real network request attempted during offline tests"):
+        s.get("https://www.sec.gov")

@@ -734,7 +734,16 @@ def normalize_annual_fact(
 
     accn = filing["accession"]
     report_date = filing["report_date"]
-    cik = normalize_cik(companyfacts.get("cik", filing.get("cik", "")))
+
+    cf_cik_raw = companyfacts.get("cik")
+    filing_cik_raw = filing.get("cik")
+    if cf_cik_raw is not None and filing_cik_raw is not None:
+        if normalize_cik(cf_cik_raw) != normalize_cik(filing_cik_raw):
+            raise ValueError(
+                f"Company identity mismatch in fact normalization: "
+                f"Company Facts CIK '{normalize_cik(cf_cik_raw)}' does not match filing CIK '{normalize_cik(filing_cik_raw)}'."
+            )
+    cik = normalize_cik(filing_cik_raw if filing_cik_raw is not None else cf_cik_raw or "")
 
     selected_facts: list[dict[str, Any]] = []
 
@@ -792,15 +801,11 @@ def normalize_annual_fact(
         return None
 
     # Handle multiple matching entries / candidate tags
+    unique_vals = {f["val"] for f in selected_facts}
+    if len(unique_vals) > 1:
+        return None  # Conflicting candidate values -> ambiguous
+
     if metric == "revenue":
-        by_tag: dict[str, Any] = {}
-        for f in selected_facts:
-            by_tag[f["tag"]] = f["val"]
-
-        unique_vals = set(by_tag.values())
-        if len(unique_vals) > 1:
-            return None  # Conflicting candidate values -> ambiguous
-
         # Select deterministically according to candidate_tags priority
         chosen_fact = None
         for tag in candidate_tags:
@@ -811,9 +816,6 @@ def normalize_annual_fact(
             if chosen_fact:
                 break
     else:
-        unique_vals = {f["val"] for f in selected_facts}
-        if len(unique_vals) > 1:
-            return None  # Conflicting values -> ambiguous
         chosen_fact = selected_facts[0]
 
     if not chosen_fact:
@@ -830,11 +832,8 @@ def normalize_annual_fact(
     else:
         final_val = str(raw_val)
 
-    # Use actual cached file SHA-256 if available, or compute byte hash
+    # Preserve actual saved file SHA-256; for mock/in-memory data without a file hash, use None
     cf_sha256 = companyfacts.get("_file_sha256")
-    if not cf_sha256:
-        cf_bytes = json.dumps(companyfacts, sort_keys=True).encode("utf-8")
-        cf_sha256 = hashlib.sha256(cf_bytes).hexdigest()
 
     return {
         "ticker": filing.get("ticker", ""),
@@ -856,6 +855,82 @@ def normalize_annual_fact(
         "selection_policy": "original_filing",
         "companyfacts_sha256": cf_sha256,
     }
+
+
+def _is_filing_record_valid(
+    filing: Mapping[str, Any] | None,
+    facts: list[dict[str, Any]] | None,
+) -> bool:
+    """Check if an existing filing and its stored facts are valid on disk."""
+    if not filing or not isinstance(filing, dict):
+        return False
+    if filing.get("status") != "downloaded":
+        return False
+    local_path_str = filing.get("local_path")
+    if not local_path_str:
+        return False
+    local_path = Path(local_path_str)
+    if not local_path.is_file():
+        return False
+    try:
+        content = local_path.read_bytes()
+        validate_filing_html(content)
+        expected_sha = filing.get("file_sha256")
+        if expected_sha:
+            actual_sha = hashlib.sha256(content).hexdigest()
+            if actual_sha != expected_sha:
+                return False
+    except Exception:
+        return False
+
+    if facts:
+        for f in facts:
+            if not isinstance(f, dict):
+                return False
+            if f.get("ticker") != filing.get("ticker") or f.get("fiscal_year") != filing.get("fiscal_year"):
+                return False
+    return True
+
+
+def _record_pair_failure(
+    pair: tuple[str, int],
+    error_msg: str,
+    existing_filings_by_pair: dict[tuple[str, int], dict[str, Any]],
+    existing_facts_by_pair: dict[tuple[str, int], list[dict[str, Any]]],
+    status: str = "failed",
+    source_url: str | None = None,
+    accession: str | None = None,
+    filing_date: str | None = None,
+    period_end_date: str | None = None,
+    primary_document: str | None = None,
+) -> None:
+    """Record a failure for a ticker/year pair, preserving valid existing data when available."""
+    prev_filing = existing_filings_by_pair.get(pair)
+    prev_facts = existing_facts_by_pair.get(pair)
+
+    if _is_filing_record_valid(prev_filing, prev_facts):
+        if prev_filing is not None:
+            err_list = prev_filing.setdefault("errors", [])
+            err_list.append(f"Refresh failed: {error_msg}")
+        return
+
+    existing_filings_by_pair[pair] = {
+        "ticker": pair[0],
+        "fiscal_year": pair[1],
+        "status": status,
+        "local_path": None,
+        "source_url": source_url,
+        "accession": accession,
+        "filing_date": filing_date,
+        "period_end_date": period_end_date,
+        "primary_document": primary_document,
+        "form": "10-K",
+        "file_sha256": None,
+        "selected_metrics": [],
+        "unavailable_metrics": {m: error_msg for m in SUPPORTED_METRICS},
+        "errors": [error_msg],
+    }
+    existing_facts_by_pair.pop(pair, None)
 
 
 def collect_data(
@@ -897,25 +972,44 @@ def collect_data(
     if manifest_file.is_file():
         try:
             m_prev = json.loads(manifest_file.read_text(encoding="utf-8"))
-            for f_rec in m_prev.get("filings", []):
+            if not isinstance(m_prev, dict):
+                raise ValueError("Manifest root must be a JSON object.")
+            if "filings" not in m_prev or not isinstance(m_prev["filings"], list):
+                raise ValueError("Manifest missing required 'filings' array.")
+            for f_rec in m_prev["filings"]:
+                if not isinstance(f_rec, dict) or "ticker" not in f_rec or "fiscal_year" not in f_rec:
+                    raise ValueError("Manifest filing entry is missing required fields.")
                 key = (f_rec["ticker"], f_rec["fiscal_year"])
                 existing_filings_by_pair[key] = f_rec
             for id_rec in m_prev.get("company_identities", []):
-                existing_identities[id_rec["ticker"]] = id_rec
-        except Exception:
-            pass
+                if isinstance(id_rec, dict) and "ticker" in id_rec:
+                    existing_identities[id_rec["ticker"]] = id_rec
+        except Exception as exc:
+            raise ValueError(f"Corrupted or invalid manifest at {manifest_file}: {exc}") from exc
 
     existing_facts_by_pair: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
     if facts_file.is_file():
         try:
             with facts_file.open("r", encoding="utf-8") as f:
-                for line in f:
-                    if line.strip():
-                        fact_rec = json.loads(line)
-                        key = (fact_rec["ticker"], fact_rec["fiscal_year"])
-                        existing_facts_by_pair[key].append(fact_rec)
-        except Exception:
-            pass
+                for line_no, line in enumerate(f, 1):
+                    line_str = line.strip()
+                    if not line_str:
+                        continue
+                    try:
+                        fact_rec = json.loads(line_str)
+                    except Exception as err:
+                        raise ValueError(f"Corrupted JSON on line {line_no} in {facts_file}: {err}") from err
+                    if (
+                        not isinstance(fact_rec, dict)
+                        or "ticker" not in fact_rec
+                        or "fiscal_year" not in fact_rec
+                        or "metric" not in fact_rec
+                    ):
+                        raise ValueError(f"Invalid fact structure at line {line_no} in {facts_file}")
+                    key = (fact_rec["ticker"], fact_rec["fiscal_year"])
+                    existing_facts_by_pair[key].append(fact_rec)
+        except Exception as exc:
+            raise ValueError(f"Corrupted or invalid facts file at {facts_file}: {exc}") from exc
 
     if session is None:
         session = make_sec_session(user_agent)
@@ -933,47 +1027,13 @@ def collect_data(
         ticker_mapping = {}
         for t in target_tickers:
             for y in target_years:
-                pair = (t, y)
-                if pair not in existing_filings_by_pair or existing_filings_by_pair[pair].get("status") != "downloaded":
-                    existing_filings_by_pair[pair] = {
-                        "ticker": t,
-                        "fiscal_year": y,
-                        "status": "failed",
-                        "local_path": None,
-                        "source_url": None,
-                        "accession": None,
-                        "filing_date": None,
-                        "period_end_date": None,
-                        "primary_document": None,
-                        "form": "10-K",
-                        "file_sha256": None,
-                        "selected_metrics": [],
-                        "unavailable_metrics": {m: stop_access_error for m in SUPPORTED_METRICS},
-                        "errors": [stop_access_error],
-                    }
+                _record_pair_failure((t, y), stop_access_error, existing_filings_by_pair, existing_facts_by_pair)
                 run_failed += 1
     except Exception as exc:
         ticker_mapping = {}
         for t in target_tickers:
             for y in target_years:
-                pair = (t, y)
-                if pair not in existing_filings_by_pair or existing_filings_by_pair[pair].get("status") != "downloaded":
-                    existing_filings_by_pair[pair] = {
-                        "ticker": t,
-                        "fiscal_year": y,
-                        "status": "failed",
-                        "local_path": None,
-                        "source_url": None,
-                        "accession": None,
-                        "filing_date": None,
-                        "period_end_date": None,
-                        "primary_document": None,
-                        "form": "10-K",
-                        "file_sha256": None,
-                        "selected_metrics": [],
-                        "unavailable_metrics": {m: str(exc) for m in SUPPORTED_METRICS},
-                        "errors": [str(exc)],
-                    }
+                _record_pair_failure((t, y), str(exc), existing_filings_by_pair, existing_facts_by_pair)
                 run_failed += 1
 
     # 3. Process requested companies
@@ -987,24 +1047,7 @@ def collect_data(
         if stop_access_error:
             # SEC access denied: stop further network requests immediately
             for y in target_years:
-                pair = (company.ticker, y)
-                if pair not in existing_filings_by_pair or existing_filings_by_pair[pair].get("status") != "downloaded":
-                    existing_filings_by_pair[pair] = {
-                        "ticker": company.ticker,
-                        "fiscal_year": y,
-                        "status": "failed",
-                        "local_path": None,
-                        "source_url": None,
-                        "accession": None,
-                        "filing_date": None,
-                        "period_end_date": None,
-                        "primary_document": None,
-                        "form": "10-K",
-                        "file_sha256": None,
-                        "selected_metrics": [],
-                        "unavailable_metrics": {m: stop_access_error for m in SUPPORTED_METRICS},
-                        "errors": [stop_access_error],
-                    }
+                _record_pair_failure((company.ticker, y), stop_access_error, existing_filings_by_pair, existing_facts_by_pair)
                 run_failed += 1
             continue
 
@@ -1021,46 +1064,12 @@ def collect_data(
         except SecAccessError as exc:
             stop_access_error = str(exc)
             for y in target_years:
-                pair = (company.ticker, y)
-                if pair not in existing_filings_by_pair or existing_filings_by_pair[pair].get("status") != "downloaded":
-                    existing_filings_by_pair[pair] = {
-                        "ticker": company.ticker,
-                        "fiscal_year": y,
-                        "status": "failed",
-                        "local_path": None,
-                        "source_url": None,
-                        "accession": None,
-                        "filing_date": None,
-                        "period_end_date": None,
-                        "primary_document": None,
-                        "form": "10-K",
-                        "file_sha256": None,
-                        "selected_metrics": [],
-                        "unavailable_metrics": {m: str(exc) for m in SUPPORTED_METRICS},
-                        "errors": [str(exc)],
-                    }
+                _record_pair_failure((company.ticker, y), stop_access_error, existing_filings_by_pair, existing_facts_by_pair)
                 run_failed += 1
             continue
         except Exception as exc:
             for y in target_years:
-                pair = (company.ticker, y)
-                if pair not in existing_filings_by_pair or existing_filings_by_pair[pair].get("status") != "downloaded":
-                    existing_filings_by_pair[pair] = {
-                        "ticker": company.ticker,
-                        "fiscal_year": y,
-                        "status": "failed",
-                        "local_path": None,
-                        "source_url": None,
-                        "accession": None,
-                        "filing_date": None,
-                        "period_end_date": None,
-                        "primary_document": None,
-                        "form": "10-K",
-                        "file_sha256": None,
-                        "selected_metrics": [],
-                        "unavailable_metrics": {m: str(exc) for m in SUPPORTED_METRICS},
-                        "errors": [str(exc)],
-                    }
+                _record_pair_failure((company.ticker, y), str(exc), existing_filings_by_pair, existing_facts_by_pair)
                 run_failed += 1
             continue
 
@@ -1069,104 +1078,25 @@ def collect_data(
             try:
                 filing_meta = select_annual_filing(sub, y, as_of_date=as_of, session=session, raw_dir=raw_dir)
             except AmbiguousFilingError as exc:
-                existing_filings_by_pair[pair] = {
-                    "ticker": company.ticker,
-                    "fiscal_year": y,
-                    "status": "ambiguous",
-                    "local_path": None,
-                    "source_url": None,
-                    "accession": None,
-                    "filing_date": None,
-                    "period_end_date": None,
-                    "primary_document": None,
-                    "form": "10-K",
-                    "file_sha256": None,
-                    "selected_metrics": [],
-                    "unavailable_metrics": {m: "ambiguous filing candidates" for m in SUPPORTED_METRICS},
-                    "errors": [str(exc)],
-                }
-                existing_facts_by_pair.pop(pair, None)
+                _record_pair_failure(pair, str(exc), existing_filings_by_pair, existing_facts_by_pair, status="ambiguous")
                 run_failed += 1
                 continue
             except SecAccessError as exc:
                 stop_access_error = str(exc)
-                existing_filings_by_pair[pair] = {
-                    "ticker": company.ticker,
-                    "fiscal_year": y,
-                    "status": "failed",
-                    "local_path": None,
-                    "source_url": None,
-                    "accession": None,
-                    "filing_date": None,
-                    "period_end_date": None,
-                    "primary_document": None,
-                    "form": "10-K",
-                    "file_sha256": None,
-                    "selected_metrics": [],
-                    "unavailable_metrics": {m: str(exc) for m in SUPPORTED_METRICS},
-                    "errors": [str(exc)],
-                }
+                _record_pair_failure(pair, stop_access_error, existing_filings_by_pair, existing_facts_by_pair)
                 run_failed += 1
                 curr_idx = target_years.index(y)
                 for rem_y in target_years[curr_idx + 1:]:
-                    rpair = (company.ticker, rem_y)
-                    if rpair not in existing_filings_by_pair or existing_filings_by_pair[rpair].get("status") != "downloaded":
-                        existing_filings_by_pair[rpair] = {
-                            "ticker": company.ticker,
-                            "fiscal_year": rem_y,
-                            "status": "failed",
-                            "local_path": None,
-                            "source_url": None,
-                            "accession": None,
-                            "filing_date": None,
-                            "period_end_date": None,
-                            "primary_document": None,
-                            "form": "10-K",
-                            "file_sha256": None,
-                            "selected_metrics": [],
-                            "unavailable_metrics": {m: stop_access_error for m in SUPPORTED_METRICS},
-                            "errors": [stop_access_error],
-                        }
+                    _record_pair_failure((company.ticker, rem_y), stop_access_error, existing_filings_by_pair, existing_facts_by_pair)
                     run_failed += 1
                 break
             except Exception as exc:
-                existing_filings_by_pair[pair] = {
-                    "ticker": company.ticker,
-                    "fiscal_year": y,
-                    "status": "failed",
-                    "local_path": None,
-                    "source_url": None,
-                    "accession": None,
-                    "filing_date": None,
-                    "period_end_date": None,
-                    "primary_document": None,
-                    "form": "10-K",
-                    "file_sha256": None,
-                    "selected_metrics": [],
-                    "unavailable_metrics": {m: str(exc) for m in SUPPORTED_METRICS},
-                    "errors": [str(exc)],
-                }
+                _record_pair_failure(pair, str(exc), existing_filings_by_pair, existing_facts_by_pair)
                 run_failed += 1
                 continue
 
             if not filing_meta:
-                existing_filings_by_pair[pair] = {
-                    "ticker": company.ticker,
-                    "fiscal_year": y,
-                    "status": "missing",
-                    "local_path": None,
-                    "source_url": None,
-                    "accession": None,
-                    "filing_date": None,
-                    "period_end_date": None,
-                    "primary_document": None,
-                    "form": "10-K",
-                    "file_sha256": None,
-                    "selected_metrics": [],
-                    "unavailable_metrics": {m: "filing not found in SEC submissions" for m in SUPPORTED_METRICS},
-                    "errors": [],
-                }
-                existing_facts_by_pair.pop(pair, None)
+                _record_pair_failure(pair, "filing not found in SEC submissions", existing_filings_by_pair, existing_facts_by_pair, status="missing")
                 run_failed += 1
                 continue
 
@@ -1174,7 +1104,6 @@ def collect_data(
             filing_meta["company_name"] = name
             filing_meta["sector"] = sector
 
-            # Check expected sha from previous manifest if available
             prev_sha = existing_filings_by_pair.get(pair, {}).get("file_sha256")
 
             try:
@@ -1186,66 +1115,35 @@ def collect_data(
                 )
             except SecAccessError as exc:
                 stop_access_error = str(exc)
-                existing_filings_by_pair[pair] = {
-                    "ticker": company.ticker,
-                    "fiscal_year": y,
-                    "status": "failed",
-                    "local_path": None,
-                    "source_url": filing_meta["source_url"],
-                    "accession": filing_meta["accession"],
-                    "filing_date": filing_meta["filing_date"],
-                    "period_end_date": filing_meta["report_date"],
-                    "primary_document": filing_meta["primary_document"],
-                    "form": "10-K",
-                    "file_sha256": None,
-                    "selected_metrics": [],
-                    "unavailable_metrics": {m: str(exc) for m in SUPPORTED_METRICS},
-                    "errors": [str(exc)],
-                }
+                _record_pair_failure(
+                    pair,
+                    stop_access_error,
+                    existing_filings_by_pair,
+                    existing_facts_by_pair,
+                    source_url=filing_meta["source_url"],
+                    accession=filing_meta["accession"],
+                    filing_date=filing_meta["filing_date"],
+                    period_end_date=filing_meta["report_date"],
+                    primary_document=filing_meta["primary_document"],
+                )
                 run_failed += 1
                 curr_idx = target_years.index(y)
                 for rem_y in target_years[curr_idx + 1:]:
-                    rpair = (company.ticker, rem_y)
-                    if rpair not in existing_filings_by_pair or existing_filings_by_pair[rpair].get("status") != "downloaded":
-                        existing_filings_by_pair[rpair] = {
-                            "ticker": company.ticker,
-                            "fiscal_year": rem_y,
-                            "status": "failed",
-                            "local_path": None,
-                            "source_url": None,
-                            "accession": None,
-                            "filing_date": None,
-                            "period_end_date": None,
-                            "primary_document": None,
-                            "form": "10-K",
-                            "file_sha256": None,
-                            "selected_metrics": [],
-                            "unavailable_metrics": {m: stop_access_error for m in SUPPORTED_METRICS},
-                            "errors": [stop_access_error],
-                        }
+                    _record_pair_failure((company.ticker, rem_y), stop_access_error, existing_filings_by_pair, existing_facts_by_pair)
                     run_failed += 1
                 break
             except Exception as exc:
-                # If fresh download failed but we already had a valid downloaded file, preserve it
-                if existing_filings_by_pair.get(pair, {}).get("status") == "downloaded":
-                    run_failed += 1
-                    continue
-                existing_filings_by_pair[pair] = {
-                    "ticker": company.ticker,
-                    "fiscal_year": y,
-                    "status": "failed",
-                    "local_path": None,
-                    "source_url": filing_meta["source_url"],
-                    "accession": filing_meta["accession"],
-                    "filing_date": filing_meta["filing_date"],
-                    "period_end_date": filing_meta["report_date"],
-                    "primary_document": filing_meta["primary_document"],
-                    "form": "10-K",
-                    "file_sha256": None,
-                    "selected_metrics": [],
-                    "unavailable_metrics": {m: f"HTML download failed: {exc}" for m in SUPPORTED_METRICS},
-                    "errors": [f"HTML download failed: {exc}"],
-                }
+                _record_pair_failure(
+                    pair,
+                    f"HTML download failed: {exc}",
+                    existing_filings_by_pair,
+                    existing_facts_by_pair,
+                    source_url=filing_meta["source_url"],
+                    accession=filing_meta["accession"],
+                    filing_date=filing_meta["filing_date"],
+                    period_end_date=filing_meta["report_date"],
+                    primary_document=filing_meta["primary_document"],
+                )
                 run_failed += 1
                 continue
 
@@ -1297,9 +1195,15 @@ def collect_data(
     )
 
     all_facts: list[dict[str, Any]] = []
+    seen_fact_keys: set[tuple[str, int, str]] = set()
     for f_rec in all_filings:
-        pair = (f_rec["ticker"], f_rec["fiscal_year"])
-        all_facts.extend(existing_facts_by_pair.get(pair, []))
+        if f_rec.get("status") == "downloaded":
+            pair = (f_rec["ticker"], f_rec["fiscal_year"])
+            for fact in existing_facts_by_pair.get(pair, []):
+                f_key = (fact["ticker"], fact["fiscal_year"], fact["metric"])
+                if f_key not in seen_fact_keys:
+                    seen_fact_keys.add(f_key)
+                    all_facts.append(fact)
 
     # Write facts.jsonl atomically
     facts_lines = [json.dumps(fact) + "\n" for fact in all_facts]
