@@ -393,3 +393,293 @@ def test_cli_argument_parsing() -> None:
 
     with pytest.raises(SystemExit):
         parse_args([])
+
+
+def test_long_unbroken_text_multiple_bounded_chunks() -> None:
+    """Confirm 1,000 short consecutive lines without blank lines produces multiple bounded chunks."""
+    lines = [f"Line {i} discusses annual financial performance, operating margins, and corporate strategy." for i in range(1000)]
+    html = f"<html><body><p>{''.join(lines)}</p></body></html>"
+    text = extract_visible_text(html)
+
+    chunks = make_chunks(text, SAMPLE_FILING_RECORD_MSFT, "hash_unbroken")
+    assert len(chunks) > 1
+
+    for ch in chunks:
+        words = len(ch["text"].split())
+        assert words <= 500
+        assert text[ch["char_start"] : ch["char_end"]] == ch["text"]
+
+
+def test_large_table_row_boundary_chunking() -> None:
+    """Confirm a large financial table is split at row boundaries with numbers and labels intact."""
+    rows = ["<tr><th>Account</th><th>FY24</th><th>FY23</th></tr>"]
+    for i in range(120):
+        rows.append(f"<tr><td>Line Item {i} Revenue Description</td><td>$ {1000 + i}</td><td>$ {900 + i}</td></tr>")
+    table_html = f"<html><body><table>{''.join(rows)}</table></body></html>"
+    text = extract_visible_text(table_html)
+
+    chunks = make_chunks(text, SAMPLE_FILING_RECORD_MSFT, "hash_table")
+    assert len(chunks) > 1
+
+    for ch in chunks:
+        assert text[ch["char_start"] : ch["char_end"]] == ch["text"]
+        for line in ch["text"].splitlines():
+            if line.strip():
+                assert " | " in line
+                assert "Line Item" in line or "Account" in line
+
+
+def test_empty_table_cells_preserve_alignment() -> None:
+    """Confirm empty cells in financial tables preserve column alignment."""
+    html = """<html><body><table>
+    <tr><th>Category</th><th>FY24</th><th>FY23</th></tr>
+    <tr><td>Operating Income</td><td></td><td>$ 1,234</td></tr>
+    <tr><td>Net Margin</td><td>15.2%</td><td></td></tr>
+    </table></body></html>"""
+    soup = BeautifulSoup(html, "lxml")
+    tbl = soup.find("table")
+    txt = extract_table_text(tbl)
+
+    rows = txt.splitlines()
+    assert rows[0] == "Category | FY24 | FY23"
+    assert rows[1] == "Operating Income |  | $ 1,234"
+    assert rows[2] == "Net Margin | 15.2% | "
+
+
+def test_toc_only_document_receives_unknown_confidence() -> None:
+    """Confirm a document containing only TOC entries gets unknown section metadata."""
+    html = """<html><body>
+    <h2>TABLE OF CONTENTS</h2>
+    <table>
+      <tr><td>Item 1 | Business | 3</td></tr>
+      <tr><td>Item 1A | Risk Factors | 12</td></tr>
+      <tr><td>Item 7 | Management's Discussion and Analysis | 34</td></tr>
+      <tr><td>Item 7A | Quantitative and Qualitative Disclosures | 50</td></tr>
+      <tr><td>Item 8 | Financial Statements | 60</td></tr>
+    </table>
+    </body></html>"""
+    text = extract_visible_text(html)
+    sections = extract_sections(text)
+    assert len(sections) == 0
+
+    chunks = make_chunks(text, SAMPLE_FILING_RECORD_MSFT, "hash_toc_only")
+    assert len(chunks) > 0
+    for ch in chunks:
+        assert ch["section"] == "unknown"
+        assert ch["section_confidence"] == "unknown"
+        assert text[ch["char_start"] : ch["char_end"]] == ch["text"]
+
+
+def test_repeated_section_headings_distinguished() -> None:
+    """Confirm repeated mentions of an item heading are distinguished and the real body heading is chosen."""
+    html = """<html><body>
+    <table><tr><td>Item 1A | Risk Factors | 15</td></tr></table>
+    <p>Please refer to Item 1A: Risk Factors in our annual filing for further discussion.</p>
+    <p>Forward looking remarks note that Item 1A contains essential risk descriptions.</p>
+    
+    <h2>ITEM 1A. RISK FACTORS</h2>
+    <p>Our operations face substantial market risks, regulatory risks, and technological disruption risks worldwide.</p>
+    <p>Supply chain constraints could impede delivery schedules and diminish quarterly gross operating margins.</p>
+    <p>Foreign exchange currency fluctuations may adversely affect reported consolidated revenues in multiple territories.</p>
+    </body></html>"""
+    text = extract_visible_text(html)
+    sections = extract_sections(text)
+
+    item1a_sections = [s for s in sections if s["name"] == "Item 1A - Risk Factors"]
+    assert len(item1a_sections) == 1
+    sec = item1a_sections[0]
+    assert sec["confidence"] == "high"
+    heading_text = text[sec["start"] : sec["start"] + 50]
+    assert "ITEM 1A. RISK FACTORS" in heading_text
+    assert "Item 1A | Risk Factors | 15" not in heading_text
+
+
+def test_incomplete_or_unusual_headings_receive_unknown_metadata() -> None:
+    """Confirm incomplete or stub headings receive unknown confidence and metadata."""
+    html = """<html><body>
+    <p>Introductory company remarks regarding fiscal year operations and disclosures.</p>
+    <h2>ITEM 1A. RISK FACTORS</h2>
+    <p>Stub.</p>
+    </body></html>"""
+    text = extract_visible_text(html)
+    sections = extract_sections(text)
+    assert len(sections) == 1
+    assert sections[0]["name"] == "unknown"
+    assert sections[0]["confidence"] == "unknown"
+
+    chunks = make_chunks(text, SAMPLE_FILING_RECORD_MSFT, "hash_stub")
+    for ch in chunks:
+        assert ch["section"] == "unknown"
+        assert ch["section_confidence"] == "unknown"
+
+
+def test_valid_character_offsets_and_no_lost_content() -> None:
+    """Confirm character offsets match canonical text and no text is lost."""
+    html = """<html><body>
+    <p>The first paragraph contains distinct prose discussing technology products and enterprise solutions.</p>
+    <p>The second paragraph provides extensive operational metrics regarding our global distribution network.</p>
+    <table>
+      <tr><th>Metric</th><th>FY24</th></tr>
+      <tr><td>Total Deliveries</td><td>1,500,000</td></tr>
+    </table>
+    <p>Final concluding thoughts regarding corporate governance and board committee oversight activities.</p>
+    </body></html>"""
+    text = extract_visible_text(html)
+    chunks = make_chunks(text, SAMPLE_FILING_RECORD_MSFT, "hash_offsets")
+
+    for ch in chunks:
+        assert text[ch["char_start"] : ch["char_end"]] == ch["text"]
+
+    for keyword in ["first paragraph", "second paragraph", "Total Deliveries", "Final concluding"]:
+        assert any(keyword in ch["text"] for ch in chunks)
+
+
+def test_incremental_corpus_merging_and_no_duplicates(tmp_path: Path) -> None:
+    """Confirm incremental merging preserves unrelated filings and avoids duplicates."""
+    manifest_file = tmp_path / "filing_manifest.json"
+    manifest_file.write_text(json.dumps([SAMPLE_FILING_RECORD_MSFT, SAMPLE_FILING_RECORD_XOM]), encoding="utf-8")
+
+    raw_dir = tmp_path / "raw"
+    processed_dir = tmp_path / "processed" / "text"
+    chunks_path = tmp_path / "processed" / "chunks.jsonl"
+
+    session = MagicMock(spec=requests.Session)
+    session.get.return_value = create_mock_response(200, SAMPLE_HTML.encode("utf-8"))
+
+    # Step 1: Process MSFT
+    summary1 = build_filing_corpus(
+        tickers=["MSFT"],
+        years=[2024],
+        manifest_path=manifest_file,
+        raw_dir=raw_dir,
+        processed_dir=processed_dir,
+        chunks_path=chunks_path,
+        session=session,
+    )
+    assert summary1["filings_succeeded"] == 1
+    msft_chunk_count = summary1["total_chunks"]
+    assert msft_chunk_count > 0
+
+    # Step 2: Process XOM incrementally
+    summary2 = build_filing_corpus(
+        tickers=["XOM"],
+        years=[2024],
+        manifest_path=manifest_file,
+        raw_dir=raw_dir,
+        processed_dir=processed_dir,
+        chunks_path=chunks_path,
+        session=session,
+    )
+    assert summary2["filings_succeeded"] == 1
+    lines2 = [json.loads(l) for l in chunks_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    tickers2 = {l["ticker"] for l in lines2}
+    assert tickers2 == {"MSFT", "XOM"}
+    assert len(lines2) > msft_chunk_count
+
+    # Step 3: Reprocess MSFT - should replace older chunks, no duplicates, same total count
+    summary3 = build_filing_corpus(
+        tickers=["MSFT"],
+        years=[2024],
+        manifest_path=manifest_file,
+        raw_dir=raw_dir,
+        processed_dir=processed_dir,
+        chunks_path=chunks_path,
+        session=session,
+    )
+    lines3 = [json.loads(l) for l in chunks_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    assert len(lines3) == len(lines2)
+    tickers3 = {l["ticker"] for l in lines3}
+    assert tickers3 == {"MSFT", "XOM"}
+    chunk_ids3 = [l["chunk_id"] for l in lines3]
+    assert len(chunk_ids3) == len(set(chunk_ids3))
+
+
+def test_existing_corpus_preserved_on_failure(tmp_path: Path) -> None:
+    """Confirm existing corpus file remains untouched if a filing download fails."""
+    manifest_file = tmp_path / "filing_manifest.json"
+    manifest_file.write_text(json.dumps([SAMPLE_FILING_RECORD_MSFT, SAMPLE_FILING_RECORD_XOM]), encoding="utf-8")
+
+    raw_dir = tmp_path / "raw"
+    processed_dir = tmp_path / "processed" / "text"
+    chunks_path = tmp_path / "processed" / "chunks.jsonl"
+
+    session_ok = MagicMock(spec=requests.Session)
+    session_ok.get.return_value = create_mock_response(200, SAMPLE_HTML.encode("utf-8"))
+
+    build_filing_corpus(
+        tickers=["MSFT"],
+        years=[2024],
+        manifest_path=manifest_file,
+        raw_dir=raw_dir,
+        processed_dir=processed_dir,
+        chunks_path=chunks_path,
+        session=session_ok,
+    )
+    initial_content = chunks_path.read_text(encoding="utf-8")
+
+    session_err = MagicMock(spec=requests.Session)
+    session_err.get.return_value = create_mock_response(500, b"Server Error")
+
+    summary_err = build_filing_corpus(
+        tickers=["XOM"],
+        years=[2024],
+        manifest_path=manifest_file,
+        raw_dir=raw_dir,
+        processed_dir=processed_dir,
+        chunks_path=chunks_path,
+        session=session_err,
+    )
+    assert summary_err["filings_failed"] == 1
+    assert chunks_path.read_text(encoding="utf-8") == initial_content
+
+
+def test_corrupt_corpus_file_rejected(tmp_path: Path) -> None:
+    """Confirm corrupted existing chunks.jsonl is rejected rather than silently overwritten."""
+    manifest_file = tmp_path / "filing_manifest.json"
+    manifest_file.write_text(json.dumps([SAMPLE_FILING_RECORD_MSFT]), encoding="utf-8")
+
+    chunks_path = tmp_path / "chunks.jsonl"
+    chunks_path.write_text("{this is not valid json\n", encoding="utf-8")
+
+    session = MagicMock(spec=requests.Session)
+    session.get.return_value = create_mock_response(200, SAMPLE_HTML.encode("utf-8"))
+
+    with pytest.raises(ValueError) as exc:
+        build_filing_corpus(
+            tickers=["MSFT"],
+            years=[2024],
+            manifest_path=manifest_file,
+            chunks_path=chunks_path,
+            session=session,
+        )
+    assert "Corrupt JSON" in str(exc.value) or "Failed to read existing corpus" in str(exc.value)
+
+
+def test_cli_nonzero_exit_on_failure() -> None:
+    """Confirm the CLI exits with nonzero status on filing processing failure."""
+    from src.filings import main
+
+    with pytest.raises(SystemExit) as exc:
+        main(["--tickers", "UNKNOWN_NONEXISTENT", "--years", "2024"])
+    assert exc.value.code == 1
+
+
+def test_deduplicate_repeated_ticker_and_years(tmp_path: Path) -> None:
+    """Confirm repeated ticker and year arguments are deduplicated."""
+    manifest_file = tmp_path / "filing_manifest.json"
+    manifest_file.write_text(json.dumps([SAMPLE_FILING_RECORD_MSFT]), encoding="utf-8")
+
+    session = MagicMock(spec=requests.Session)
+    session.get.return_value = create_mock_response(200, SAMPLE_HTML.encode("utf-8"))
+
+    summary = build_filing_corpus(
+        tickers=["MSFT", "msft", "MSFT"],
+        years=[2024, 2024],
+        manifest_path=manifest_file,
+        chunks_path=tmp_path / "chunks.jsonl",
+        raw_dir=tmp_path / "raw",
+        processed_dir=tmp_path / "processed",
+        session=session,
+    )
+    assert summary["filings_requested"] == 1
+    assert summary["filings_succeeded"] == 1

@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 import uuid
 import warnings
 from pathlib import Path
@@ -222,19 +223,29 @@ def download_filing(
 
 
 def extract_table_text(table_tag: Tag) -> str:
-    """Format an HTML table tag into a readable string preserving rows and cells.
+    """Format an HTML table tag into a readable string preserving rows, cells, and alignment.
 
     Preserves numbers, negative signs, decimals, commas, percentages, currency symbols.
+    Preserves empty cell positions so column alignment is maintained across rows.
     Cells in a row are separated by ' | '.
     """
     rows = []
     for tr in table_tag.find_all("tr"):
         cells = []
         for cell in tr.find_all(["th", "td"]):
+            colspan_val = 1
+            if hasattr(cell, "attrs") and isinstance(cell.attrs, dict):
+                try:
+                    colspan_val = int(cell.attrs.get("colspan", 1))
+                except (ValueError, TypeError):
+                    colspan_val = 1
+
             text = " ".join(cell.get_text(" ", strip=True).split())
-            if text:
-                cells.append(text)
-        if cells:
+            cells.append(text)
+            for _ in range(colspan_val - 1):
+                cells.append("")
+
+        if any(c for c in cells):
             rows.append(" | ".join(cells))
     return "\n".join(rows)
 
@@ -319,8 +330,39 @@ def extract_visible_text(html_content: str | bytes) -> str:
     return canonical_text
 
 
+def is_toc_heading(pos: int, text: str, all_item_positions: list[int]) -> bool:
+    """Check if an item match position is part of a Table of Contents or index."""
+    window = text[pos : min(len(text), pos + 300)]
+    first_lines = "\n".join(window.splitlines()[:2])
+
+    clean_lines = re.sub(r"[\|\s]+$", "", first_lines)
+    for l in clean_lines.splitlines():
+        l_sub = re.sub(r"[\|\s]+$", "", l)
+        if re.search(r"(?:\||\.{2,}|\s{3,}|\t)\s*\b\d+(?:\s*-\s*\d+)?(?:\s*\|)?$", l_sub):
+            return True
+        if re.search(r"\|\s*\d+(?:\s*-\s*\d+)?\s*\|", l):
+            return True
+
+    preceding = text[max(0, pos - 500) : pos].upper()
+    if "TABLE OF CONTENTS" in preceding or "INDEX" in preceding:
+        if " | " in first_lines or re.search(r"\bPAGE\b", preceding):
+            return True
+
+    subsequent_items = [p for p in all_item_positions if p > pos + 10]
+    if subsequent_items:
+        next_p = subsequent_items[0]
+        l_end = text.find("\n", pos)
+        if l_end == -1:
+            l_end = len(text)
+        intervening = text[l_end:next_p].strip()
+        if len(intervening) < 80:
+            return True
+
+    return False
+
+
 def extract_sections(canonical_text: str) -> list[dict[str, Any]]:
-    """Identify key 10-K report sections with confidence levels.
+    """Identify key 10-K report sections with conservative confidence levels.
 
     Detects:
     - Item 1 - Business
@@ -330,7 +372,7 @@ def extract_sections(canonical_text: str) -> list[dict[str, Any]]:
     - Item 8 - Financial Statements
 
     Distinguishes Table of Contents headings from actual report body sections.
-    Assigns confidence: 'high', 'low', or 'unknown'.
+    Assigns confidence: 'high' or 'unknown'.
     """
     all_item_matches = [m.start() for m in ANY_ITEM_PATTERN.finditer(canonical_text)]
 
@@ -344,19 +386,7 @@ def extract_sections(canonical_text: str) -> list[dict[str, Any]]:
         body_match = None
         for m in matches:
             pos = m.start()
-            l_end = canonical_text.find("\n", pos)
-            line = canonical_text[pos : l_end if l_end != -1 else pos + 150]
-
-            # Check if TOC heading:
-            # - Ends with pipe and page number or dots (e.g. '| 15' or '... 15')
-            # - Or if multiple matches exist, the earlier matches are TOC
-            is_toc = False
-            if re.search(r"(?:\|\s*\d+|\.{2,}\s*\d+)\s*$", line):
-                is_toc = True
-            elif len(matches) > 1 and m != matches[-1]:
-                is_toc = True
-
-            if not is_toc:
+            if not is_toc_heading(pos, canonical_text, all_item_matches):
                 body_match = m
                 break
 
@@ -374,9 +404,16 @@ def extract_sections(canonical_text: str) -> list[dict[str, Any]]:
             end_pos = subsequent[0] if subsequent else len(canonical_text)
 
         length = end_pos - start_pos
-        confidence = "high" if length >= 2000 else "low"
+        # Conservative confidence: require at least 100 characters of substantive body prose
+        if length >= 100:
+            confidence = "high"
+            assigned_name = sec_name
+        else:
+            confidence = "unknown"
+            assigned_name = "unknown"
+
         sections.append({
-            "name": sec_name,
+            "name": assigned_name,
             "start": start_pos,
             "end": end_pos,
             "confidence": confidence,
@@ -386,33 +423,70 @@ def extract_sections(canonical_text: str) -> list[dict[str, Any]]:
     return sections
 
 
+def segment_canonical_text(canonical_text: str, max_line_words: int = 80) -> list[tuple[int, int, int, bool]]:
+    """Split canonical text into contiguous atomic units without dropping words or depending on blank lines.
+
+    Preserves row boundaries for financial tables.
+    Splits long unbroken prose lines into sentence or word-boundary spans.
+    Returns:
+        list of (start_char, end_char, word_count, is_table_row)
+    """
+    line_pattern = re.compile(r"[^\n]+")
+    units: list[tuple[int, int, int, bool]] = []
+
+    for m in line_pattern.finditer(canonical_text):
+        line = m.group()
+        words = line.split()
+        if not words:
+            continue
+
+        is_table = " | " in line
+        line_start = m.start()
+        line_end = m.end()
+
+        if is_table or len(words) <= max_line_words:
+            units.append((line_start, line_end, len(words), is_table))
+        else:
+            # Long unbroken prose line: split contiguously on sentence or word boundaries
+            word_matches = list(re.finditer(r"\S+", line))
+            s_idx = 0
+            while s_idx < len(word_matches):
+                e_idx = min(s_idx + max_line_words, len(word_matches))
+                best_end = e_idx
+                for j in range(e_idx - 1, s_idx, -1):
+                    if word_matches[j].group()[-1] in ".!?":
+                        best_end = j + 1
+                        break
+                sub_start = line_start + word_matches[s_idx].start()
+                sub_end = line_start + word_matches[best_end - 1].end()
+                w_count = best_end - s_idx
+                units.append((sub_start, sub_end, w_count, False))
+                s_idx = best_end
+
+    return units
+
+
 def make_chunks(
     canonical_text: str,
     filing_record: dict[str, Any],
     file_sha256: str,
     sections: list[dict[str, Any]] | None = None,
     target_words: int = 400,
+    min_words: int = 300,
+    max_words: int = 500,
     overlap_words: int = 50,
 ) -> list[dict[str, Any]]:
     """Generate source-aware evidence chunks from canonical filing text.
 
-    Targets ~300-500 words per chunk with ~50 words overlap on paragraph boundaries.
+    Targets ~300-500 words per chunk with ~50 words overlap.
     Preserves exact character offsets such that canonical_text[char_start:char_end] == chunk['text'].
+    Does not depend on blank lines alone; handles long unbroken text and large tables safely.
     """
     if sections is None:
         sections = extract_sections(canonical_text)
 
-    blocks: list[tuple[int, int, str, int]] = []
-    for m in re.finditer(r'(?:\S[^\n]*\n?)+', canonical_text):
-        text = m.group().strip()
-        if text:
-            start = m.start()
-            exact_start = canonical_text.find(text, start)
-            exact_end = exact_start + len(text)
-            word_count = len(text.split())
-            blocks.append((exact_start, exact_end, text, word_count))
-
-    if not blocks:
+    units = segment_canonical_text(canonical_text, max_line_words=80)
+    if not units:
         return []
 
     ticker = filing_record["ticker"]
@@ -436,30 +510,36 @@ def make_chunks(
     i = 0
     seq = 1
 
-    while i < len(blocks):
+    while i < len(units):
         cur_words = 0
         start_idx = i
         end_idx = i
-        current_sec_name, _ = get_section_info(blocks[start_idx][0], blocks[start_idx][1])
+        current_sec_name, _ = get_section_info(units[start_idx][0], units[start_idx][1])
 
-        while end_idx < len(blocks):
-            b_start, b_end, _, b_words = blocks[end_idx]
-            block_sec, _ = get_section_info(b_start, b_end)
+        while end_idx < len(units):
+            u_start, u_end, u_words, _ = units[end_idx]
+            block_sec, _ = get_section_info(u_start, u_end)
 
+            # Do not cross into a different recognized section
             if end_idx > start_idx and block_sec != current_sec_name and block_sec != "unknown":
                 break
 
-            if cur_words > 0 and cur_words + b_words > (target_words + 100):
+            # If we already have adequate words (>= min_words) and adding would exceed max_words
+            if cur_words >= min_words and (cur_words + u_words > max_words):
                 break
 
-            cur_words += b_words
+            # If adding unit exceeds max_words and we have at least one unit
+            if cur_words > 0 and (cur_words + u_words > max_words):
+                break
+
+            cur_words += u_words
             end_idx += 1
 
             if cur_words >= target_words:
                 break
 
-        c_start = blocks[start_idx][0]
-        c_end = blocks[end_idx - 1][1]
+        c_start = units[start_idx][0]
+        c_end = units[end_idx - 1][1]
         c_text = canonical_text[c_start:c_end]
         sec_name, sec_conf = get_section_info(c_start, c_end)
 
@@ -485,14 +565,21 @@ def make_chunks(
         }
         chunks.append(chunk_record)
 
-        if end_idx >= len(blocks):
+        if end_idx >= len(units):
             break
 
+        # Calculate overlap
         next_i = end_idx
-        overlap_accum = 0
+        accum_overlap = 0
         for j in range(end_idx - 1, start_idx, -1):
-            overlap_accum += blocks[j][3]
-            if overlap_accum >= overlap_words:
+            j_sec, _ = get_section_info(units[j][0], units[j][1])
+            if end_idx < len(units):
+                next_sec, _ = get_section_info(units[end_idx][0], units[end_idx][1])
+                if j_sec != next_sec:
+                    break
+
+            accum_overlap += units[j][2]
+            if accum_overlap >= overlap_words:
                 next_i = j
                 break
 
@@ -518,7 +605,12 @@ def build_filing_corpus(
     chunks_path: Path | None = None,
     session: requests.Session | None = None,
 ) -> dict[str, Any]:
-    """Build the source-aware filing text corpus and write chunks.jsonl atomically."""
+    """Build or update the source-aware filing text corpus and write chunks.jsonl atomically.
+
+    Protects existing corpus by incrementally merging records and preserving unrelated filings.
+    Rejects corrupt existing corpus files rather than silently overwriting them.
+    Fails safely without modifying the corpus if any requested filing encounters an error.
+    """
     if manifest is not None:
         manifest_records = manifest
     elif manifest_path is not None:
@@ -533,17 +625,6 @@ def build_filing_corpus(
     if not all_filings and (not tickers or not years):
         raise ValueError("Must specify either --all or both tickers and years.")
 
-    if all_filings:
-        target_records = manifest_records
-    else:
-        tickers_clean = [t.strip().upper() for t in tickers]
-        years_list = list(years)
-        target_records = [
-            find_filing(t, y, manifest=manifest_records)
-            for t in tickers_clean
-            for y in years_list
-        ]
-
     raw_filings_dir = Path(raw_dir) if raw_dir is not None else DEFAULT_RAW_FILINGS_DIR
     processed_text_dir = Path(processed_dir) if processed_dir is not None else DEFAULT_PROCESSED_TEXT_DIR
     out_chunks_path = Path(chunks_path) if chunks_path is not None else DEFAULT_CHUNKS_PATH
@@ -552,11 +633,64 @@ def build_filing_corpus(
     processed_text_dir.mkdir(parents=True, exist_ok=True)
     out_chunks_path.parent.mkdir(parents=True, exist_ok=True)
 
-    sec_session = session if session is not None else make_sec_session()
+    # 1. Load and validate existing corpus if present
+    existing_chunks: list[dict[str, Any]] = []
+    if out_chunks_path.is_file():
+        try:
+            with open(out_chunks_path, "r", encoding="utf-8") as f:
+                for line_no, line in enumerate(f, start=1):
+                    clean_line = line.strip()
+                    if not clean_line:
+                        continue
+                    try:
+                        record = json.loads(clean_line)
+                    except Exception as exc:
+                        raise ValueError(f"Corrupt JSON on line {line_no} in existing corpus {out_chunks_path}: {exc}") from exc
+                    if not isinstance(record, dict) or "chunk_id" not in record or "accession" not in record:
+                        raise ValueError(f"Invalid chunk record on line {line_no} in existing corpus {out_chunks_path}")
+                    existing_chunks.append(record)
+        except Exception as exc:
+            raise ValueError(f"Failed to read existing corpus at {out_chunks_path}: {exc}") from exc
 
     successes: list[str] = []
     failures: list[dict[str, Any]] = []
-    all_chunks: list[dict[str, Any]] = []
+    new_chunks: list[dict[str, Any]] = []
+
+    target_records: list[dict[str, Any]] = []
+    if all_filings:
+        target_records = manifest_records
+    else:
+        # Deduplicate ticker and year arguments while preserving order
+        unique_pairs: list[tuple[str, int]] = []
+        seen_pairs: set[tuple[str, int]] = set()
+        for t in tickers:
+            t_clean = t.strip().upper()
+            for y in years:
+                pair = (t_clean, y)
+                if pair not in seen_pairs:
+                    seen_pairs.add(pair)
+                    unique_pairs.append(pair)
+
+        for t, y in unique_pairs:
+            try:
+                rec = find_filing(t, y, manifest=manifest_records)
+                target_records.append(rec)
+            except Exception as exc:
+                failures.append({"identifier": f"{t} FY{y}", "error": str(exc)})
+
+    if failures:
+        return {
+            "filings_requested": len(unique_pairs),
+            "filings_succeeded": 0,
+            "filings_failed": len(failures),
+            "successes": successes,
+            "failures": failures,
+            "chunks_generated": 0,
+            "total_chunks": len(existing_chunks),
+            "chunks_path": str(out_chunks_path),
+        }
+
+    sec_session = session if session is not None else make_sec_session()
 
     for rec in target_records:
         ticker = rec["ticker"]
@@ -573,16 +707,37 @@ def build_filing_corpus(
 
             sections = extract_sections(canonical_text)
             chunks = make_chunks(canonical_text, rec, file_hash, sections=sections)
-            all_chunks.extend(chunks)
+            new_chunks.extend(chunks)
             successes.append(ident)
         except Exception as exc:
             failures.append({"identifier": ident, "error": str(exc)})
+
+    # If ANY requested filing fails, do NOT overwrite or replace the existing corpus
+    if failures:
+        return {
+            "filings_requested": len(target_records),
+            "filings_succeeded": len(successes),
+            "filings_failed": len(failures),
+            "successes": successes,
+            "failures": failures,
+            "chunks_generated": 0,
+            "total_chunks": len(existing_chunks),
+            "chunks_path": str(out_chunks_path),
+        }
+
+    # Incremental merge: replace older chunks for matching accessions, retain unrelated filings
+    if all_filings:
+        final_chunks = new_chunks
+    else:
+        processed_accessions = {rec["accession_number"] for rec in target_records}
+        retained_chunks = [c for c in existing_chunks if c.get("accession") not in processed_accessions]
+        final_chunks = retained_chunks + new_chunks
 
     # Atomically write chunks.jsonl
     tmp_chunks = out_chunks_path.parent / f"chunks.jsonl.tmp_{uuid.uuid4().hex}"
     try:
         with open(tmp_chunks, "w", encoding="utf-8") as f:
-            for ch in all_chunks:
+            for ch in final_chunks:
                 f.write(json.dumps(ch, ensure_ascii=False) + "\n")
         tmp_chunks.replace(out_chunks_path)
     except Exception as exc:
@@ -596,7 +751,8 @@ def build_filing_corpus(
         "filings_failed": len(failures),
         "successes": successes,
         "failures": failures,
-        "total_chunks": len(all_chunks),
+        "chunks_generated": len(new_chunks),
+        "total_chunks": len(final_chunks),
         "chunks_path": str(out_chunks_path),
     }
 
@@ -624,12 +780,14 @@ def main(argv: list[str] | None = None) -> None:
     print(f"Filings requested: {summary['filings_requested']}")
     print(f"Filings succeeded: {summary['filings_succeeded']}")
     print(f"Filings failed:    {summary['filings_failed']}")
+    print(f"Chunks generated:  {summary['chunks_generated']}")
     print(f"Total chunks:      {summary['total_chunks']}")
     print(f"Chunks saved to:   {summary['chunks_path']}")
     if summary["failures"]:
         print("Failures encountered:")
         for fail in summary["failures"]:
             print(f"  - {fail['identifier']}: {fail['error']}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
