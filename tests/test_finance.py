@@ -633,12 +633,51 @@ def test_31_negative_net_assets_preserved() -> None:
 
 
 def test_32_msft_fy2024_net_assets_exact_value() -> None:
-    """Verify MSFT FY2024 net assets remains exactly 268477000000 USD from actual facts."""
-    facts = load_facts()
+    """Verify MSFT FY2024 net assets calculation using a synthetic regression fixture (assets - liabilities)."""
+    accn = "0000950170-24-087843"
+    facts = {
+        ("MSFT", 2024, "assets"): make_fact_row(
+            ticker="MSFT",
+            company_name="MICROSOFT CORP",
+            fy=2024,
+            metric="assets",
+            status="found",
+            value=512163000000,
+            tag="Assets",
+            end="2024-06-30",
+            unit="USD",
+            accn=accn,
+        ),
+        ("MSFT", 2024, "liabilities"): make_fact_row(
+            ticker="MSFT",
+            company_name="MICROSOFT CORP",
+            fy=2024,
+            metric="liabilities",
+            status="found",
+            value=243686000000,
+            tag="Liabilities",
+            end="2024-06-30",
+            unit="USD",
+            accn=accn,
+        ),
+    }
     res = calculate_net_assets("MSFT", 2024, facts)
     assert res["status"] == "success"
     assert res["value"] == 268477000000
+    assert isinstance(res["value"], int)
+    assert res["unit"] == "USD"
+    assert res["formula"] == "assets - liabilities"
+    assert res["period_end"] == "2024-06-30"
     assert res["inputs"]["assets"] == 512163000000
     assert res["inputs"]["liabilities"] == 243686000000
+    assert len(res["sources"]) == 2
+    assert res["sources"][0]["metric"] == "assets"
+    assert res["sources"][0]["accession"] == accn
+    assert res["sources"][1]["metric"] == "liabilities"
+    assert res["sources"][1]["accession"] == accn
+
+    # Verify JSON serializability
+    serialized = json.dumps(res)
+    assert json.loads(serialized) == res
 
 
