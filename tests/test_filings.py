@@ -651,9 +651,10 @@ def test_cli_nonzero_exit_on_failure() -> None:
     """Confirm the CLI exits with nonzero status on filing processing failure."""
     from src.filings import main
 
-    with pytest.raises(SystemExit) as exc:
-        main(["--tickers", "UNKNOWN_NONEXISTENT", "--years", "2024"])
-    assert exc.value.code == 1
+    with patch("src.filings.load_filing_manifest", return_value=[SAMPLE_FILING_RECORD_MSFT]):
+        with pytest.raises(SystemExit) as exc:
+            main(["--tickers", "UNKNOWN_NONEXISTENT", "--years", "2024"])
+        assert exc.value.code == 1
 
 
 def test_deduplicate_repeated_ticker_and_years(tmp_path: Path) -> None:
